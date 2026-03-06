@@ -1,0 +1,6 @@
+dependencies:
+  esp-idf-lib/bmi160:
+    version: '*'
+  esp-idf-lib/i2cdev: '*'
+description: tap_detection
+version: 1.0.0

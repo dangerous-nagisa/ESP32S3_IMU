@@ -1,0 +1,19 @@
+# ESP-IDF build outputs
+build/
+sdkconfig
+sdkconfig.old
+*.pyc
+
+# Dependencies lock file (keep .yml, ignore lock)
+dependencies.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

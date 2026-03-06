@@ -1,0 +1,10 @@
+dependencies:
+  cmake_utilities:
+    version: 0.*
+  espressif/i2c_bus: 1.*
+  idf:
+    version: '>=5.2'
+description: I2C driver for ICM 42688 6-Axis MotionTracking
+repository: git://github.com/nickchen110/ICM42688_SensorAPI.git
+url: https://github.com/nickchen110/ICM42688_SensorAPI
+version: 1.0.3

@@ -1,0 +1,32 @@
+dependencies:
+  esp-idf-lib/esp_idf_lib_helpers:
+    version: '*'
+  esp-idf-lib/i2cdev:
+    version: '*'
+description: Driver for BMI160 ultra-small, low power, low noise 16 bit IMU
+discussion: https://github.com/esp-idf-lib/core/discussions
+documentation: https://esp-idf-lib.github.io/bmi160/
+files:
+  exclude:
+  - docs/**/*
+issues: https://github.com/esp-idf-lib/bmi160/issues
+license: ISC
+maintainers:
+- 2025 Lukasz Bielinski <lbielinski01@gmail.com>
+repository: git://github.com/esp-idf-lib/bmi160.git
+repository_info:
+  commit_sha: 33799838ef69b2bf638f3a42b3a0d1339327eb6f
+  path: .
+targets:
+- esp32
+- esp32c2
+- esp32c3
+- esp32c5
+- esp32c6
+- esp32c61
+- esp32h2
+- esp32p4
+- esp32s2
+- esp32s3
+url: https://github.com/esp-idf-lib/core
+version: 1.0.3
