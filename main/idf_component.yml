@@ -17,5 +17,4 @@ dependencies:
   nickchen110/icm42688: ^1.0.3
   esp-idf-lib/bmi160: ^1.0.3
   espp/filters: ^1.0.35
-  espressif/esp_tinyusb: ^1.4.4
   espressif/led_strip: ^2.5.5
