@@ -13,6 +13,8 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "icm42688.h"
 #include "i2cdev.h"
 #include "led_strip.h"
@@ -175,11 +177,13 @@ void wifi_event_handler(void* arg, esp_event_base_t event_base,
             }
             dest_addr.sin_family = AF_INET;
             dest_addr.sin_port = htons(UDP_SERVER_PORT);
-            xSemaphoreGive(dest_addr_mutex);
-        }
 
-        // 设置连接标志（最后设置，确保dest_addr已更新）
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+            // 设置连接标志（在锁内设置，确保dest_addr已更新）
+            xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+            xSemaphoreGive(dest_addr_mutex);
+        } else {
+            ESP_LOGW(TAG, "Failed to acquire mutex for dest_addr update");
+        }
     }
 }
 
@@ -305,8 +309,16 @@ void send_imu_data_via_udp(
     frame.header[1] = 0x55;
     frame.timestamp_ms = timestamp_ms;
 
-    torso_filter.get_quaternion_array(frame.quat_torso);
-    arm_filter.get_quaternion_array(frame.quat_arm);
+    // 使用临时数组避免packed结构未对齐访问
+    float torso_quat_temp[4];
+    float arm_quat_temp[4];
+    torso_filter.get_quaternion_array(torso_quat_temp);
+    arm_filter.get_quaternion_array(arm_quat_temp);
+
+    for (int i = 0; i < 4; i++) {
+        frame.quat_torso[i] = torso_quat_temp[i];
+        frame.quat_arm[i] = arm_quat_temp[i];
+    }
 
     frame.torso_accel[0] = torso_sample.ax;
     frame.torso_accel[1] = torso_sample.ay;
@@ -1007,15 +1019,16 @@ extern "C" void app_main(void) {
                     ESP_LOGE(TAG, "ICM42688 runtime recover failed: %s", esp_err_to_name(recover_ret));
                 }
             }
-            vTaskDelay(SAMPLE_PERIOD_TICKS);
-            continue;
+            // ICM读取失败，但仍然发送降级帧（只包含BMI数据）
+            // 使用零值填充arm数据，保持数据流连续
+        } else {
+            icm_consecutive_failures = 0;
+            apply_gyro_bias(&arm_sample, icm_gyro_bias);
+            const EulerAngles arm_euler = update_filter(&arm_filter, arm_sample, dt_s);
         }
-        icm_consecutive_failures = 0;
+
         ImuSample torso_sample {};
         const esp_err_t bmi_ret = read_bmi160_sample(&bmi, &torso_sample);
-        apply_gyro_bias(&arm_sample, icm_gyro_bias);
-
-        const EulerAngles arm_euler = update_filter(&arm_filter, arm_sample, dt_s);
 
         if (bmi_ret != ESP_OK) {
             bmi_consecutive_failures++;
