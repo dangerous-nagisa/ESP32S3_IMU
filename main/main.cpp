@@ -33,7 +33,8 @@ constexpr gpio_num_t RGB_LED_GPIO = GPIO_NUM_48;  // RGB LED (WS2812)
 constexpr i2c_port_num_t ICM_I2C_PORT = I2C_NUM_0;
 constexpr i2c_port_t BMI_I2C_PORT = static_cast<i2c_port_t>(I2C_NUM_1);
 
-constexpr uint32_t I2C_FREQ_HZ = 400000;
+constexpr uint32_t ICM_I2C_FREQ_HZ = 100000;  // 降低到100kHz提高抗干扰
+constexpr uint32_t BMI_I2C_FREQ_HZ = 400000;  // BMI160保持400kHz
 constexpr TickType_t SAMPLE_PERIOD_TICKS = pdMS_TO_TICKS(20);  // 50Hz采样
 constexpr TickType_t CALIBRATION_WARMUP_TICKS = pdMS_TO_TICKS(2000);
 constexpr TickType_t CALIBRATION_SAMPLE_DELAY_TICKS = pdMS_TO_TICKS(5);
@@ -46,6 +47,14 @@ constexpr float DEG_TO_RAD = static_cast<float>(M_PI / 180.0);
 
 constexpr uint8_t ICM_I2C_ADDRESS = ICM42688_I2C_ADDRESS;
 constexpr uint8_t BMI_I2C_ADDRESS = BMI160_I2C_ADDRESS_VDD;
+constexpr uint8_t ICM_EXPECTED_DEVICE_ID = 0x47;
+constexpr int IMU_INIT_MAX_RETRIES = 5;
+constexpr int IMU_RUNTIME_RECOVER_RETRIES = 5;
+constexpr int64_t IMU_RECOVER_COOLDOWN_US = 300 * 1000;
+constexpr int IMU_RECOVER_TRIGGER_CONSECUTIVE_ERRORS = 4;
+constexpr TickType_t IMU_BUS_SETTLE_TICKS = pdMS_TO_TICKS(20);
+constexpr int ICM_READ_RETRY_COUNT = 3;
+constexpr TickType_t ICM_READ_RETRY_DELAY_TICKS = pdMS_TO_TICKS(2);
 
 struct EulerAngles {
     float pitch;
@@ -297,41 +306,72 @@ void usb_send_task(void *arg) {
 
     uint32_t send_count = 0;
     uint32_t error_count = 0;
+    uint32_t drop_count = 0;
     imu_data_frame_t frame;
+    bool has_pending_frame = false;
+    size_t pending_offset = 0;
 
     while (true) {
-        // 从环形缓冲区读取数据
-        if (usb_ring_buffer.pop(&frame)) {
-            // 尝试发送
-            esp_err_t ret = tinyusb_cdcacm_write_queue(
-                TINYUSB_CDC_ACM_0,
-                (uint8_t*)&frame,
-                sizeof(frame)
-            );
-
-            if (ret != ESP_OK) {
-                error_count++;
-                if (error_count % 100 == 1) {
-                    ESP_LOGW(TAG, "USB send failed: %s (total errors: %lu)", esp_err_to_name(ret), error_count);
-                }
-                // 发送失败，等待一下再重试
+        if (!has_pending_frame) {
+            if (!usb_ring_buffer.pop(&frame)) {
                 vTaskDelay(pdMS_TO_TICKS(10));
-            } else {
-                send_count++;
-                if (send_count % 100 == 0) {
-                    ESP_LOGI(TAG, "USB sent %lu frames (errors: %lu, buffer: %zu)",
-                             send_count, error_count, usb_ring_buffer.available());
-                }
-                // 发送成功，短暂延迟让出CPU
-                vTaskDelay(1);
+                continue;
             }
-        } else {
-            // 缓冲区空，等待新数据
-            vTaskDelay(pdMS_TO_TICKS(10));
+            has_pending_frame = true;
+            pending_offset = 0;
         }
+
+        if (!tud_cdc_n_connected(0)) {
+            has_pending_frame = false;
+            drop_count++;
+            if (drop_count % 200 == 1) {
+                ESP_LOGW(TAG, "USB host not connected, dropped pending frame (total drops: %lu)", drop_count);
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        const uint8_t *payload = reinterpret_cast<const uint8_t*>(&frame);
+        const size_t remain = sizeof(frame) - pending_offset;
+        const size_t queued = tinyusb_cdcacm_write_queue(
+            TINYUSB_CDC_ACM_0,
+            payload + pending_offset,
+            remain
+        );
+
+        // tinyusb_cdcacm_write_queue returns queued byte count, not esp_err_t
+        esp_err_t flush_ret = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
+        if (flush_ret != ESP_OK && flush_ret != ESP_ERR_NOT_FINISHED) {
+            error_count++;
+            if (error_count % 100 == 1) {
+                ESP_LOGW(TAG, "USB flush failed: %s (total errors: %lu)", esp_err_to_name(flush_ret), error_count);
+            }
+        }
+
+        if (queued == 0) {
+            error_count++;
+            if (error_count % 100 == 1) {
+                ESP_LOGW(TAG, "USB queue busy/full, retrying (total errors: %lu)", error_count);
+            }
+            vTaskDelay(1);
+            continue;
+        }
+
+        pending_offset += queued;
+        if (pending_offset < sizeof(frame)) {
+            vTaskDelay(1);
+            continue;
+        }
+
+        has_pending_frame = false;
+        send_count++;
+        if (send_count % 100 == 0) {
+            ESP_LOGI(TAG, "USB sent %lu frames (errors: %lu, buffer: %zu)",
+                     send_count, error_count, usb_ring_buffer.available());
+        }
+        vTaskDelay(1);
     }
 }
-
 // RGB LED句柄
 static led_strip_handle_t led_strip = nullptr;
 
@@ -386,6 +426,55 @@ struct Bmi160Context {
     bmi160_t sensor {};
 };
 
+bool should_attempt_imu_recover(esp_err_t err) {
+    return err == ESP_ERR_INVALID_STATE ||
+           err == ESP_ERR_TIMEOUT ||
+           err == ESP_ERR_INVALID_RESPONSE ||
+           err == ESP_FAIL;
+}
+
+void deinit_icm42688(Icm42688Context *ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    if (ctx->sensor != nullptr) {
+        icm42688_delete(ctx->sensor);
+        ctx->sensor = nullptr;
+    }
+    if (ctx->bus != nullptr) {
+        i2c_del_master_bus(ctx->bus);
+        ctx->bus = nullptr;
+    }
+    ctx->accel_sensitivity = 1.0f;
+    ctx->gyro_sensitivity = 1.0f;
+}
+
+void deinit_bmi160(Bmi160Context *ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+    bmi160_free(&ctx->sensor);
+    std::memset(&ctx->sensor, 0, sizeof(ctx->sensor));
+}
+
+esp_err_t verify_icm_device_id(icm42688_handle_t sensor) {
+    if (sensor == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t dev_id = 0;
+    esp_err_t ret = icm42688_get_deviceid(sensor, &dev_id);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (dev_id != ICM_EXPECTED_DEVICE_ID) {
+        ESP_LOGE(TAG, "ICM42688 device ID mismatch: 0x%02X (expected 0x%02X)",
+                 dev_id, ICM_EXPECTED_DEVICE_ID);
+        return ESP_ERR_NOT_FOUND;
+    }
+    return ESP_OK;
+}
+
 void scan_i2c_bus(i2c_master_bus_handle_t bus, const char *bus_name) {
     ESP_LOGI(TAG, "Scanning %s...", bus_name);
     bool found = false;
@@ -421,6 +510,19 @@ esp_err_t init_scan_bus(i2c_port_t port, gpio_num_t sda, gpio_num_t scl, i2c_mas
 }
 
 esp_err_t init_icm_bus(i2c_master_bus_handle_t *bus) {
+    // 先配置GPIO驱动强度
+    gpio_config_t io_conf = {};
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_INPUT_OUTPUT_OD;  // 开漏模式
+    io_conf.pin_bit_mask = (1ULL << ICM_I2C_SDA) | (1ULL << ICM_I2C_SCL);
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;  // 启用内部上拉
+    gpio_config(&io_conf);
+
+    // 设置强驱动
+    gpio_set_drive_capability(ICM_I2C_SDA, GPIO_DRIVE_CAP_3);  // 最强驱动
+    gpio_set_drive_capability(ICM_I2C_SCL, GPIO_DRIVE_CAP_3);
+
     const i2c_master_bus_config_t bus_config = {
         .i2c_port = ICM_I2C_PORT,
         .sda_io_num = ICM_I2C_SDA,
@@ -439,8 +541,24 @@ esp_err_t init_icm_bus(i2c_master_bus_handle_t *bus) {
 }
 
 esp_err_t init_icm42688(Icm42688Context *ctx) {
+    if (ctx == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    deinit_icm42688(ctx);
+    vTaskDelay(IMU_BUS_SETTLE_TICKS);
     ESP_RETURN_ON_ERROR(init_icm_bus(&ctx->bus), TAG, "failed to create ICM42688 I2C bus");
-    ESP_RETURN_ON_ERROR(icm42688_create(ctx->bus, ICM_I2C_ADDRESS, &ctx->sensor), TAG, "failed to create ICM42688 device");
+
+    esp_err_t create_ret = icm42688_create(ctx->bus, ICM_I2C_ADDRESS, &ctx->sensor);
+    if (create_ret != ESP_OK) {
+        // icm42688_create may return soft-reset related errors even when handle is valid.
+        if (!(create_ret == ESP_ERR_INVALID_STATE && ctx->sensor != nullptr)) {
+            ESP_RETURN_ON_ERROR(create_ret, TAG, "failed to create ICM42688 device");
+        }
+        ESP_LOGW(TAG, "ICM42688 create returned %s, continue with explicit ID verify",
+                 esp_err_to_name(create_ret));
+    }
+
+    ESP_RETURN_ON_ERROR(verify_icm_device_id(ctx->sensor), TAG, "failed to verify ICM42688 ID");
 
     const icm42688_cfg_t config = {
         .acce_fs = ACCE_FS_4G,
@@ -452,6 +570,7 @@ esp_err_t init_icm42688(Icm42688Context *ctx) {
     ESP_RETURN_ON_ERROR(icm42688_config(ctx->sensor, &config), TAG, "failed to configure ICM42688");
     ESP_RETURN_ON_ERROR(icm42688_set_power_mode(ctx->sensor, ACCE_PWR_ON, GYRO_PWR_ON, TEMP_PWR_ON), TAG,
                         "failed to power on ICM42688");
+    vTaskDelay(pdMS_TO_TICKS(10));
     ESP_RETURN_ON_ERROR(icm42688_get_acce_sensitivity(ctx->sensor, &ctx->accel_sensitivity), TAG,
                         "failed to get ICM42688 accel sensitivity");
     ESP_RETURN_ON_ERROR(icm42688_get_gyro_sensitivity(ctx->sensor, &ctx->gyro_sensitivity), TAG,
@@ -461,6 +580,10 @@ esp_err_t init_icm42688(Icm42688Context *ctx) {
 }
 
 esp_err_t init_bmi160(Bmi160Context *ctx) {
+    if (ctx == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    deinit_bmi160(ctx);
     ESP_RETURN_ON_ERROR(i2cdev_init(), TAG, "failed to init i2cdev");
     std::memset(&ctx->sensor, 0, sizeof(ctx->sensor));
 
@@ -509,6 +632,40 @@ esp_err_t init_bmi160(Bmi160Context *ctx) {
     return ESP_OK;
 }
 
+esp_err_t init_icm42688_with_retry(Icm42688Context *ctx, int max_retries) {
+    esp_err_t last_err = ESP_FAIL;
+    for (int attempt = 1; attempt <= max_retries; ++attempt) {
+        last_err = init_icm42688(ctx);
+        if (last_err == ESP_OK) {
+            if (attempt > 1) {
+                ESP_LOGW(TAG, "ICM42688 initialized after retry %d/%d", attempt, max_retries);
+            }
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "ICM42688 init attempt %d/%d failed: %s",
+                 attempt, max_retries, esp_err_to_name(last_err));
+        vTaskDelay(pdMS_TO_TICKS(50 * attempt));
+    }
+    return last_err;
+}
+
+esp_err_t init_bmi160_with_retry(Bmi160Context *ctx, int max_retries) {
+    esp_err_t last_err = ESP_FAIL;
+    for (int attempt = 1; attempt <= max_retries; ++attempt) {
+        last_err = init_bmi160(ctx);
+        if (last_err == ESP_OK) {
+            if (attempt > 1) {
+                ESP_LOGW(TAG, "BMI160 initialized after retry %d/%d", attempt, max_retries);
+            }
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "BMI160 init attempt %d/%d failed: %s",
+                 attempt, max_retries, esp_err_to_name(last_err));
+        vTaskDelay(pdMS_TO_TICKS(50 * attempt));
+    }
+    return last_err;
+}
+
 float vector_norm3(float x, float y, float z) {
     return std::sqrt((x * x) + (y * y) + (z * z));
 }
@@ -526,12 +683,29 @@ esp_err_t read_icm42688_sample(const Icm42688Context &ctx, ImuSample *sample) {
     icm42688_raw_value_t accel_raw {};
     icm42688_raw_value_t gyro_raw {};
 
-    esp_err_t ret = icm42688_get_acce_raw_value(ctx.sensor, &accel_raw);
+    esp_err_t ret = ESP_FAIL;
+    for (int attempt = 1; attempt <= ICM_READ_RETRY_COUNT; ++attempt) {
+        ret = icm42688_get_acce_raw_value(ctx.sensor, &accel_raw);
+        if (ret == ESP_OK) {
+            break;
+        }
+        if (attempt < ICM_READ_RETRY_COUNT) {
+            vTaskDelay(ICM_READ_RETRY_DELAY_TICKS);
+        }
+    }
     if (ret != ESP_OK) {
         return ret;
     }
 
-    ret = icm42688_get_gyro_raw_value(ctx.sensor, &gyro_raw);
+    for (int attempt = 1; attempt <= ICM_READ_RETRY_COUNT; ++attempt) {
+        ret = icm42688_get_gyro_raw_value(ctx.sensor, &gyro_raw);
+        if (ret == ESP_OK) {
+            break;
+        }
+        if (attempt < ICM_READ_RETRY_COUNT) {
+            vTaskDelay(ICM_READ_RETRY_DELAY_TICKS);
+        }
+    }
     if (ret != ESP_OK) {
         return ret;
     }
@@ -749,6 +923,7 @@ extern "C" void app_main(void) {
     if (init_scan_bus(static_cast<i2c_port_t>(ICM_I2C_PORT), ICM_I2C_SDA, ICM_I2C_SCL, &scan_bus0) == ESP_OK) {
         scan_i2c_bus(scan_bus0, "scan/icm_bus");
         i2c_del_master_bus(scan_bus0);
+        vTaskDelay(IMU_BUS_SETTLE_TICKS);
     } else {
         ESP_LOGW(TAG, "failed to create scan bus for ICM bus");
     }
@@ -756,6 +931,7 @@ extern "C" void app_main(void) {
     if (init_scan_bus(BMI_I2C_PORT, BMI_I2C_SDA, BMI_I2C_SCL, &scan_bus1) == ESP_OK) {
         scan_i2c_bus(scan_bus1, "scan/bmi_bus");
         i2c_del_master_bus(scan_bus1);
+        vTaskDelay(IMU_BUS_SETTLE_TICKS);
     } else {
         ESP_LOGW(TAG, "failed to create scan bus for BMI bus");
     }
@@ -763,10 +939,10 @@ extern "C" void app_main(void) {
     Icm42688Context icm {};
     Bmi160Context bmi {};
 
-    ESP_ERROR_CHECK(init_icm42688(&icm));
+    ESP_ERROR_CHECK(init_icm42688_with_retry(&icm, IMU_INIT_MAX_RETRIES));
     ESP_LOGI(TAG, "ICM-42688 init success on I2C%d SDA=%d SCL=%d", ICM_I2C_PORT, ICM_I2C_SDA, ICM_I2C_SCL);
 
-    ESP_ERROR_CHECK(init_bmi160(&bmi));
+    ESP_ERROR_CHECK(init_bmi160_with_retry(&bmi, IMU_INIT_MAX_RETRIES));
     ESP_LOGI(TAG, "BMI160 init success on I2C%d SDA=%d SCL=%d", BMI_I2C_PORT, BMI_I2C_SDA, BMI_I2C_SCL);
 
     // Dump raw BMI160 data for diagnosis
@@ -794,6 +970,12 @@ extern "C" void app_main(void) {
 
     int64_t last_tick_us = esp_timer_get_time();
     int64_t last_bmi_update_us = last_tick_us;
+    int64_t last_icm_recover_us = 0;
+    int64_t last_bmi_recover_us = 0;
+    int icm_consecutive_failures = 0;
+    int bmi_consecutive_failures = 0;
+    uint32_t icm_error_total = 0;
+    uint32_t bmi_error_total = 0;
 
     while (true) {
         const int64_t now_us = esp_timer_get_time();
@@ -806,10 +988,29 @@ extern "C" void app_main(void) {
         ImuSample arm_sample {};
         const esp_err_t icm_ret = read_icm42688_sample(icm, &arm_sample);
         if (icm_ret != ESP_OK) {
-            ESP_LOGW(TAG, "failed to read ICM42688 sample: %s", esp_err_to_name(icm_ret));
+            icm_consecutive_failures++;
+            icm_error_total++;
+            if (icm_consecutive_failures == 1 || (icm_consecutive_failures % 10) == 0) {
+                ESP_LOGW(TAG, "failed to read ICM42688 sample: %s (consecutive=%d total=%lu)",
+                         esp_err_to_name(icm_ret), icm_consecutive_failures, icm_error_total);
+            }
+            bool trigger_by_burst = icm_consecutive_failures >= IMU_RECOVER_TRIGGER_CONSECUTIVE_ERRORS;
+            bool trigger_by_cooldown = (now_us - last_icm_recover_us) >= IMU_RECOVER_COOLDOWN_US;
+            if (should_attempt_imu_recover(icm_ret) && (trigger_by_burst || trigger_by_cooldown)) {
+                last_icm_recover_us = now_us;
+                ESP_LOGW(TAG, "Attempting ICM42688 runtime recover (consecutive=%d)...", icm_consecutive_failures);
+                esp_err_t recover_ret = init_icm42688_with_retry(&icm, IMU_RUNTIME_RECOVER_RETRIES);
+                if (recover_ret == ESP_OK) {
+                    ESP_LOGI(TAG, "ICM42688 runtime recover success");
+                    icm_consecutive_failures = 0;
+                } else {
+                    ESP_LOGE(TAG, "ICM42688 runtime recover failed: %s", esp_err_to_name(recover_ret));
+                }
+            }
             vTaskDelay(SAMPLE_PERIOD_TICKS);
             continue;
         }
+        icm_consecutive_failures = 0;
         ImuSample torso_sample {};
         const esp_err_t bmi_ret = read_bmi160_sample(&bmi, &torso_sample);
         apply_gyro_bias(&arm_sample, icm_gyro_bias);
@@ -817,8 +1018,27 @@ extern "C" void app_main(void) {
         const EulerAngles arm_euler = update_filter(&arm_filter, arm_sample, dt_s);
 
         if (bmi_ret != ESP_OK) {
-            ESP_LOGW(TAG, "failed to read BMI160 sample: %s", esp_err_to_name(bmi_ret));
+            bmi_consecutive_failures++;
+            bmi_error_total++;
+            if (bmi_consecutive_failures == 1 || (bmi_consecutive_failures % 10) == 0) {
+                ESP_LOGW(TAG, "failed to read BMI160 sample: %s (consecutive=%d total=%lu)",
+                         esp_err_to_name(bmi_ret), bmi_consecutive_failures, bmi_error_total);
+            }
+            bool trigger_by_burst = bmi_consecutive_failures >= IMU_RECOVER_TRIGGER_CONSECUTIVE_ERRORS;
+            bool trigger_by_cooldown = (now_us - last_bmi_recover_us) >= IMU_RECOVER_COOLDOWN_US;
+            if (should_attempt_imu_recover(bmi_ret) && (trigger_by_burst || trigger_by_cooldown)) {
+                last_bmi_recover_us = now_us;
+                ESP_LOGW(TAG, "Attempting BMI160 runtime recover (consecutive=%d)...", bmi_consecutive_failures);
+                esp_err_t recover_ret = init_bmi160_with_retry(&bmi, IMU_RUNTIME_RECOVER_RETRIES);
+                if (recover_ret == ESP_OK) {
+                    ESP_LOGI(TAG, "BMI160 runtime recover success");
+                    bmi_consecutive_failures = 0;
+                } else {
+                    ESP_LOGE(TAG, "BMI160 runtime recover failed: %s", esp_err_to_name(recover_ret));
+                }
+            }
         } else {
+            bmi_consecutive_failures = 0;
             // Use actual time since last BMI filter update for correct gyro integration
             float bmi_dt = static_cast<float>(now_us - last_bmi_update_us) / 1000000.0f;
             last_bmi_update_us = now_us;
@@ -827,8 +1047,12 @@ extern "C" void app_main(void) {
             }
             apply_gyro_bias(&torso_sample, bmi_gyro_bias);
             const EulerAngles torso_euler = update_filter(&torso_filter, torso_sample, bmi_dt);
-            // log_sample_and_attitude("arm/icm42688", arm_sample, arm_euler);
-            log_sample_and_attitude("torso/bmi160", torso_sample, torso_euler);
+            // High-rate logs can block main loop and starve USB sending
+            static uint32_t attitude_log_counter = 0;
+            if (++attitude_log_counter % 25 == 0) {
+                // log_sample_and_attitude("arm/icm42688", arm_sample, arm_euler);
+                log_sample_and_attitude("torso/bmi160", torso_sample, torso_euler);
+            }
 
             // 通过USB发送IMU数据
             uint32_t timestamp_ms = static_cast<uint32_t>(now_us / 1000);
