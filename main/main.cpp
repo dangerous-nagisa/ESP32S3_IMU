@@ -166,8 +166,11 @@ void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
         wifi_retry_count = 0;
 
-        // 使用互斥锁保护dest_addr更新
-        if (dest_addr_mutex && xSemaphoreTake(dest_addr_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // 先设置连接标志，确保发送函数能立即感知连接状态
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+
+        // 使用互斥锁保护dest_addr更新（使用阻塞等待确保更新成功）
+        if (dest_addr_mutex && xSemaphoreTake(dest_addr_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
             if (UDP_USE_WIFI_GATEWAY) {
                 dest_addr.sin_addr.s_addr = event->ip_info.gw.addr;
                 ESP_LOGI(TAG, "UDP target set to gateway: " IPSTR ":%d",
@@ -177,12 +180,10 @@ void wifi_event_handler(void* arg, esp_event_base_t event_base,
             }
             dest_addr.sin_family = AF_INET;
             dest_addr.sin_port = htons(UDP_SERVER_PORT);
-
-            // 设置连接标志（在锁内设置，确保dest_addr已更新）
-            xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
             xSemaphoreGive(dest_addr_mutex);
         } else {
-            ESP_LOGW(TAG, "Failed to acquire mutex for dest_addr update");
+            ESP_LOGE(TAG, "Failed to acquire mutex for dest_addr update, using fallback");
+            // 即使获取锁失败，连接标志已设置，发送函数会使用默认地址
         }
     }
 }
@@ -260,11 +261,18 @@ esp_err_t init_udp_client() {
         return ESP_FAIL;
     }
 
-    // 初始化目标地址（使用互斥锁保护）
+    // 初始化目标地址（仅在未设置时初始化，避免覆盖网关配置）
     if (dest_addr_mutex && xSemaphoreTake(dest_addr_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        dest_addr.sin_addr.s_addr = inet_addr(UDP_SERVER_IP);
-        dest_addr.sin_family = AF_INET;
-        dest_addr.sin_port = htons(UDP_SERVER_PORT);
+        // 检查是否已经由WiFi事件处理设置过（网关地址）
+        if (dest_addr.sin_family == 0) {
+            // 未设置，使用默认配置
+            dest_addr.sin_addr.s_addr = inet_addr(UDP_SERVER_IP);
+            dest_addr.sin_family = AF_INET;
+            dest_addr.sin_port = htons(UDP_SERVER_PORT);
+            ESP_LOGI(TAG, "UDP client initialized with default target: %s:%d", UDP_SERVER_IP, UDP_SERVER_PORT);
+        } else {
+            ESP_LOGI(TAG, "UDP client initialized, target already set by WiFi event");
+        }
         xSemaphoreGive(dest_addr_mutex);
     }
 
@@ -281,7 +289,6 @@ esp_err_t init_udp_client() {
     };
     setsockopt(udp_socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    ESP_LOGI(TAG, "UDP client initialized, target: %s:%d", UDP_SERVER_IP, UDP_SERVER_PORT);
     return ESP_OK;
 }
 
