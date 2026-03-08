@@ -58,7 +58,7 @@ constexpr TickType_t FILTER_INIT_RETRY_DELAY_TICKS = pdMS_TO_TICKS(20);
 constexpr float CALIBRATION_MAX_GYRO_NORM = 0.10f;  // 收紧静止阈值到0.10 rad/s (�?.7 dps)
 constexpr float CALIBRATION_MIN_ACCEL_NORM = 0.85f;
 constexpr float CALIBRATION_MAX_ACCEL_NORM = 1.15f;
-constexpr float MADGWICK_BETA_RUN = 0.05f;
+constexpr float MADGWICK_BETA_RUN = 0.3f;  // 增大Beta值提高响应速度（原0.05）
 constexpr float DEG_TO_RAD = static_cast<float>(M_PI / 180.0);
 
 constexpr uint8_t ICM_I2C_ADDRESS = ICM42688_I2C_ADDRESS;
