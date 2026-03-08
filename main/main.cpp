@@ -161,6 +161,22 @@ void wifi_event_handler(void* arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
         ESP_LOGI(TAG, "WiFi connecting...");
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        // 使用静态IP时，连接成功就设置标志位
+        ESP_LOGI(TAG, "WiFi connected (static IP mode)");
+        wifi_retry_count = 0;
+
+        // 先设置连接标志
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+
+        // 设置UDP目标地址为网关
+        if (dest_addr_mutex && xSemaphoreTake(dest_addr_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            dest_addr.sin_addr.s_addr = inet_addr("192.168.4.1");
+            dest_addr.sin_family = AF_INET;
+            dest_addr.sin_port = htons(UDP_SERVER_PORT);
+            ESP_LOGI(TAG, "UDP target set to gateway: 192.168.4.1:%d", UDP_SERVER_PORT);
+            xSemaphoreGive(dest_addr_mutex);
+        }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
         wifi_retry_count++;
@@ -232,7 +248,16 @@ esp_err_t init_wifi_sta() {
         return ret;
     }
 
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+
+    // 配置静态IP（如果P4没有DHCP服务器）
+    esp_netif_dhcpc_stop(sta_netif);
+    esp_netif_ip_info_t ip_info;
+    IP4_ADDR(&ip_info.ip, 192, 168, 4, 2);       // S3的IP: 192.168.4.2
+    IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);       // 网关: 192.168.4.1 (P4)
+    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0); // 子网掩码
+    esp_netif_set_ip_info(sta_netif, &ip_info);
+    ESP_LOGI(TAG, "Static IP configured: 192.168.4.2, Gateway: 192.168.4.1");
 
     // WiFi配置
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
