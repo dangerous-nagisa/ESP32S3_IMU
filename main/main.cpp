@@ -43,13 +43,15 @@ constexpr gpio_num_t RGB_LED_GPIO = GPIO_NUM_48;  // RGB LED (WS2812)
 constexpr i2c_port_num_t ICM_I2C_PORT = I2C_NUM_0;
 constexpr i2c_port_t BMI_I2C_PORT = static_cast<i2c_port_t>(I2C_NUM_1);
 
-constexpr uint32_t ICM_I2C_FREQ_HZ = 100000;  // 降低�?00kHz提高抗干�?
+constexpr uint32_t ICM_I2C_FREQ_HZ = 100000;  // 降低到100kHz提高抗干扰
 constexpr uint32_t BMI_I2C_FREQ_HZ = 400000;  // BMI160保持400kHz
 constexpr TickType_t SAMPLE_PERIOD_TICKS = pdMS_TO_TICKS(20);  // 50Hz采样
 constexpr TickType_t CALIBRATION_WARMUP_TICKS = pdMS_TO_TICKS(2000);
-constexpr TickType_t CALIBRATION_SAMPLE_DELAY_TICKS = pdMS_TO_TICKS(5);
-constexpr int CALIBRATION_SAMPLES = 50;  // 降低�?0个样�?
-constexpr float CALIBRATION_MAX_GYRO_NORM = 0.50f;  // 放宽陀螺仪阈�?
+constexpr TickType_t CALIBRATION_SAMPLE_DELAY_TICKS = pdMS_TO_TICKS(10);  // 匹配100Hz ODR
+constexpr int CALIBRATION_SAMPLES = 200;  // 增加样本数
+constexpr int MIN_VALID_SAMPLES = 100;  // 最低有效样本门槛
+constexpr int MAX_CALIBRATION_TIME_MS = 8000;  // 最大校准时间8秒
+constexpr float CALIBRATION_MAX_GYRO_NORM = 0.10f;  // 收紧静止阈值到0.10 rad/s (约5.7 dps)
 constexpr float CALIBRATION_MIN_ACCEL_NORM = 0.85f;
 constexpr float CALIBRATION_MAX_ACCEL_NORM = 1.15f;
 constexpr float MADGWICK_BETA_RUN = 0.05f;
@@ -732,9 +734,17 @@ GyroBias calibrate_icm42688_gyro(const Icm42688Context &ctx) {
     int valid_samples = 0;
     int read_errors = 0;
     int motion_rejects = 0;
+    int64_t start_time_ms = esp_timer_get_time() / 1000;
 
     ESP_LOGI(TAG, "Calibrating ICM42688 gyro bias, keep device still");
     for (int i = 0; i < CALIBRATION_SAMPLES; ++i) {
+        // 检查超时
+        int64_t elapsed_ms = (esp_timer_get_time() / 1000) - start_time_ms;
+        if (elapsed_ms > MAX_CALIBRATION_TIME_MS) {
+            ESP_LOGW(TAG, "ICM42688 calibration timeout after %lld ms", elapsed_ms);
+            break;
+        }
+
         ImuSample sample {};
         const esp_err_t ret = read_icm42688_sample(ctx, &sample);
         if (ret != ESP_OK) {
@@ -762,12 +772,20 @@ GyroBias calibrate_icm42688_gyro(const Icm42688Context &ctx) {
         vTaskDelay(CALIBRATION_SAMPLE_DELAY_TICKS);
     }
 
-    if (valid_samples > 0) {
-        const float scale = 1.0f / static_cast<float>(valid_samples);
-        bias.x *= scale;
-        bias.y *= scale;
-        bias.z *= scale;
+    // 检查有效样本数是否满足最低门槛
+    if (valid_samples < MIN_VALID_SAMPLES) {
+        ESP_LOGE(TAG, "ICM42688 calibration failed: only %d valid samples (minimum: %d)",
+                 valid_samples, MIN_VALID_SAMPLES);
+        ESP_LOGE(TAG, "ICM42688 calibration stats: errors=%d, motion_rejects=%d",
+                 read_errors, motion_rejects);
+        // 返回零偏置，调用者需要检查
+        return GyroBias{};
     }
+
+    const float scale = 1.0f / static_cast<float>(valid_samples);
+    bias.x *= scale;
+    bias.y *= scale;
+    bias.z *= scale;
 
     ESP_LOGI(TAG, "ICM42688 gyro bias[rad/s]=[%+.5f, %+.5f, %+.5f] from %d still samples (errors: %d, motion: %d)",
              bias.x, bias.y, bias.z, valid_samples, read_errors, motion_rejects);
@@ -795,32 +813,63 @@ esp_err_t read_bmi160_sample(Bmi160Context *ctx, ImuSample *sample) {
 GyroBias calibrate_bmi160_gyro(Bmi160Context *ctx) {
     GyroBias bias {};
     int valid_samples = 0;
+    int read_errors = 0;
+    int motion_rejects = 0;
+    int64_t start_time_ms = esp_timer_get_time() / 1000;
 
     ESP_LOGI(TAG, "Calibrating BMI160 gyro bias, keep device still");
     for (int i = 0; i < CALIBRATION_SAMPLES; ++i) {
-        ImuSample sample {};
-        if (read_bmi160_sample(ctx, &sample) != ESP_OK) {
-            vTaskDelay(CALIBRATION_SAMPLE_DELAY_TICKS);
-            continue;
+        // 检查超时
+        int64_t elapsed_ms = (esp_timer_get_time() / 1000) - start_time_ms;
+        if (elapsed_ms > MAX_CALIBRATION_TIME_MS) {
+            ESP_LOGW(TAG, "BMI160 calibration timeout after %lld ms", elapsed_ms);
+            break;
         }
-        if (is_sample_still_for_calibration(sample)) {
+
+        ImuSample sample {};
+        const esp_err_t ret = read_bmi160_sample(ctx, &sample);
+        if (ret != ESP_OK) {
+            read_errors++;
+            if (read_errors % 50 == 1) {
+                ESP_LOGW(TAG, "BMI160 read error: %s (total: %d)", esp_err_to_name(ret), read_errors);
+            }
+        } else if (is_sample_still_for_calibration(sample)) {
             bias.x += sample.gx;
             bias.y += sample.gy;
             bias.z += sample.gz;
             ++valid_samples;
+            if (valid_samples % 50 == 0) {
+                ESP_LOGI(TAG, "BMI160 calibration progress: %d/%d valid samples", valid_samples, CALIBRATION_SAMPLES);
+            }
+        } else {
+            motion_rejects++;
+            if (motion_rejects % 50 == 1) {
+                float gyro_norm = vector_norm3(sample.gx, sample.gy, sample.gz);
+                float accel_norm = vector_norm3(sample.ax, sample.ay, sample.az);
+                ESP_LOGW(TAG, "BMI160 motion detected: gyro_norm=%.3f accel_norm=%.3f (rejects: %d)",
+                         gyro_norm, accel_norm, motion_rejects);
+            }
         }
         vTaskDelay(CALIBRATION_SAMPLE_DELAY_TICKS);
     }
 
-    if (valid_samples > 0) {
-        const float scale = 1.0f / static_cast<float>(valid_samples);
-        bias.x *= scale;
-        bias.y *= scale;
-        bias.z *= scale;
+    // 检查有效样本数是否满足最低门槛
+    if (valid_samples < MIN_VALID_SAMPLES) {
+        ESP_LOGE(TAG, "BMI160 calibration failed: only %d valid samples (minimum: %d)",
+                 valid_samples, MIN_VALID_SAMPLES);
+        ESP_LOGE(TAG, "BMI160 calibration stats: errors=%d, motion_rejects=%d",
+                 read_errors, motion_rejects);
+        // 返回零偏置，调用者需要检查
+        return GyroBias{};
     }
 
-    ESP_LOGI(TAG, "BMI160 gyro bias[rad/s]=[%+.5f, %+.5f, %+.5f] from %d still samples",
-             bias.x, bias.y, bias.z, valid_samples);
+    const float scale = 1.0f / static_cast<float>(valid_samples);
+    bias.x *= scale;
+    bias.y *= scale;
+    bias.z *= scale;
+
+    ESP_LOGI(TAG, "BMI160 gyro bias[rad/s]=[%+.5f, %+.5f, %+.5f] from %d still samples (errors: %d, motion: %d)",
+             bias.x, bias.y, bias.z, valid_samples, read_errors, motion_rejects);
     return bias;
 }
 
@@ -960,10 +1009,37 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Warm up IMUs for %lu ms before calibration, keep devices still",
              static_cast<unsigned long>(CALIBRATION_WARMUP_TICKS * portTICK_PERIOD_MS));
     vTaskDelay(CALIBRATION_WARMUP_TICKS);
+
+    // 校准陀螺仪零偏
     const GyroBias icm_gyro_bias = calibrate_icm42688_gyro(icm);
     const GyroBias bmi_gyro_bias = calibrate_bmi160_gyro(&bmi);
-    initialize_filter_from_icm(&arm_filter, icm, icm_gyro_bias);
-    initialize_filter_from_bmi(&torso_filter, &bmi, bmi_gyro_bias);
+
+    // 检查校准结果（零偏置表示校准失败）
+    bool icm_calibration_valid = (icm_gyro_bias.x != 0.0f || icm_gyro_bias.y != 0.0f || icm_gyro_bias.z != 0.0f);
+    bool bmi_calibration_valid = (bmi_gyro_bias.x != 0.0f || bmi_gyro_bias.y != 0.0f || bmi_gyro_bias.z != 0.0f);
+
+    if (!icm_calibration_valid) {
+        ESP_LOGE(TAG, "ICM42688 calibration failed, cannot continue");
+        abort();
+    }
+    if (!bmi_calibration_valid) {
+        ESP_LOGE(TAG, "BMI160 calibration failed, cannot continue");
+        abort();
+    }
+
+    // 初始化姿态滤波器
+    bool icm_filter_init = initialize_filter_from_icm(&arm_filter, icm, icm_gyro_bias);
+    bool bmi_filter_init = initialize_filter_from_bmi(&torso_filter, &bmi, bmi_gyro_bias);
+
+    if (!icm_filter_init) {
+        ESP_LOGE(TAG, "ICM42688 filter initialization failed, cannot continue");
+        abort();
+    }
+    if (!bmi_filter_init) {
+        ESP_LOGE(TAG, "BMI160 filter initialization failed, cannot continue");
+        abort();
+    }
+
     ESP_LOGI(TAG, "Attitude initialization complete, entering normal output phase");
 
     // 初始化WiFi Station
