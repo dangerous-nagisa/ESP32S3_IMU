@@ -2,9 +2,10 @@
 
 ## 项目背景
 
-### 当前问题
-- ESP32-S3通过USB CDC连接ESP32-P4时，ICM42688传感器读取失败
-- USB通信产生的电磁干扰影响I2C0总线
+### 当前实现
+- 单IMU自动识别系统，支持ICM42688和BMI160传感器
+- 通过WiFi UDP发送90字节数据帧到ESP32-P4
+- 自动检测传感器类型并设置对应的device_id
 
 ### 解决方案
 采用ESP-Hosted + WiFi UDP传输，利用官方成熟方案
@@ -18,50 +19,69 @@
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                     ESP32-S3 (IMU Device)                    │
-│  ┌──────────┐    ┌──────────┐    ┌──────────────────────┐  │
-│  │ ICM42688 │───▶│  I2C0    │    │                      │  │
-│  │ (手臂)   │    │ GPIO8/9  │    │   Madgwick滤波器     │  │
-│  └──────────┘    └──────────┘    │   姿态解算           │  │
-│                                   │                      │  │
-│  ┌──────────┐    ┌──────────┐    │                      │  │
-│  │ BMI160   │───▶│  I2C1    │───▶│   数据打包           │  │
-│  │ (躯干)   │    │ GPIO16/17│    │   CRC校验            │  │
-│  └──────────┘    └──────────┘    │                      │  │
-│                                   └──────────┬───────────┘  │
-│                                              │              │
-│                                   ┌──────────▼───────────┐  │
-│                                   │   WiFi Station       │  │
-│                                   │   UDP Client         │  │
-│                                   │   连接到C6 SoftAP    │  │
-│                                   └──────────┬───────────┘  │
-└────────────────────────────────────────────┼───────────────┘
-                                              │
-                                              │ WiFi 2.4GHz
-                                              │ UDP数据包
-                                              │
-┌────────────────────────────────────────────▼───────────────┐
-│                     ESP32-P4 + C6系统                       │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │              ESP32-C6 (WiFi协处理器)                  │  │
-│  │                                                       │  │
-│  │  ┌──────────────────┐    ┌──────────────────────┐   │  │
-│  │  │  WiFi SoftAP     │◀───│  S3连接              │   │  │
-│  │  │  192.168.4.1     │    │  192.168.4.2         │   │  │
-│  │  └────────┬─────────┘    └──────────────────────┘   │  │
-│  │           │                                          │  │
-│  │  ┌────────▼─────────┐    ┌──────────────────────┐   │  │
-│  │  │  UDP Server      │───▶│  ESP-Hosted          │   │  │
-│  │  │  Port 8888       │    │  SDIO Slave          │   │  │
-│  │  └──────────────────┘    └──────────┬───────────┘   │  │
-│  └────────────────────────────────────┼─────────────────┘  │
-│                                        │ SDIO接口          │
-│                             ┌──────────▼───────────┐       │
-│                             │  ESP32-P4主控        │       │
-│                             │  SDIO Host           │       │
-│                             │  lwIP TCP/IP栈       │       │
-│                             │  UDP Client读取      │       │
-│                             └──────────────────────┘       │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │         自动检测IMU传感器                             │   │
+│  │  ┌──────────┐         ┌──────────┐                  │   │
+│  │  │ ICM42688 │  或     │ BMI160   │                  │   │
+│  │  │ (I2C0)   │         │ (I2C1)   │                  │   │
+│  │  │ GPIO8/9  │         │ GPIO16/17│                  │   │
+│  │  └─────┬────┘         └─────┬────┘                  │   │
+│  │        │                    │                        │   │
+│  │        └────────┬───────────┘                        │   │
+│  │                 │                                    │   │
+│  │        ┌────────▼────────┐                           │   │
+│  │        │  检测到ICM42688 │                           │   │
+│  │        │  → device_id=1  │                           │   │
+│  │        │  → 填充arm字段  │                           │   │
+│  │        │                 │                           │   │
+│  │        │  检测到BMI160   │                           │   │
+│  │        │  → device_id=2  │                           │   │
+│  │        │  → 填充torso字段│                           │   │
+│  │        └────────┬────────┘                           │   │
+│  └─────────────────┼────────────────────────────────────┘   │
+│                    │                                         │
+│         ┌──────────▼───────────┐                             │
+│         │  Madgwick滤波器      │                             │
+│         │  姿态解算            │                             │
+│         │  数据打包(90字节)    │                             │
+│         │  CRC校验             │                             │
+│         └──────────┬───────────┘                             │
+│                    │                                         │
+│         ┌──────────▼───────────┐                             │
+│         │   WiFi Station       │                             │
+│         │   UDP Client         │                             │
+│         │   静态IP: 192.168.4.2│                             │
+│         │   目标: 192.168.4.1  │                             │
+│         └──────────┬───────────┘                             │
+└────────────────────┼─────────────────────────────────────────┘
+                     │
+                     │ WiFi 2.4GHz
+                     │ UDP数据包 (90字节)
+                     │
+┌────────────────────▼─────────────────────────────────────────┐
+│                     ESP32-P4 + C6系统                        │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │              ESP32-C6 (WiFi协处理器)                  │   │
+│  │                                                       │   │
+│  │  ┌──────────────────┐    ┌──────────────────────┐   │   │
+│  │  │  WiFi SoftAP     │◀───│  S3连接              │   │   │
+│  │  │  192.168.4.1     │    │  192.168.4.2         │   │   │
+│  │  └────────┬─────────┘    └──────────────────────┘   │   │
+│  │           │                                          │   │
+│  │  ┌────────▼─────────┐    ┌──────────────────────┐   │   │
+│  │  │  UDP Server      │───▶│  ESP-Hosted          │   │   │
+│  │  │  Port 8888       │    │  SDIO Slave          │   │   │
+│  │  └──────────────────┘    └──────────┬───────────┘   │   │
+│  └────────────────────────────────────┼─────────────────┘   │
+│                                        │ SDIO接口           │
+│                             ┌──────────▼───────────┐        │
+│                             │  ESP32-P4主控        │        │
+│                             │  SDIO Host           │        │
+│                             │  lwIP TCP/IP栈       │        │
+│                             │  UDP Client读取      │        │
+│                             └──────────────────────┘        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -80,7 +100,8 @@
 #### 网络配置
 ```
 C6 SoftAP:    192.168.4.1
-S3 Station:   192.168.4.2 (DHCP分配)
+S3 Station:   192.168.4.2 (静态IP)
+UDP目标:      192.168.4.1:8888
 P4通过C6:     192.168.4.1 (共享C6的IP)
 ```
 
@@ -107,7 +128,7 @@ P4通过C6:     192.168.1.100 (共享C6的IP)
 
 ### 1. ESP32-S3端（UDP Client）
 
-#### 1.1 WiFi Station配置
+#### 1.1 WiFi Station配置（静态IP）
 ```c
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -119,11 +140,22 @@ P4通过C6:     192.168.1.100 (共享C6的IP)
 #define UDP_SERVER_IP  "192.168.4.1"      // C6的IP
 #define UDP_SERVER_PORT 8888
 
-// WiFi初始化
+// WiFi初始化（静态IP）
 void wifi_init_sta() {
     esp_netif_init();
     esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
+
+    // 创建Station接口
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+
+    // 配置静态IP
+    esp_netif_dhcpc_stop(sta_netif);  // 停止DHCP客户端
+
+    esp_netif_ip_info_t ip_info;
+    IP4_ADDR(&ip_info.ip, 192, 168, 4, 2);       // S3静态IP
+    IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);       // 网关(C6)
+    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0); // 子网掩码
+    esp_netif_set_ip_info(sta_netif, &ip_info);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
@@ -139,6 +171,8 @@ void wifi_init_sta() {
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     esp_wifi_start();
     esp_wifi_connect();
+
+    ESP_LOGI(TAG, "WiFi Station initialized with static IP: 192.168.4.2");
 }
 ```
 
@@ -169,41 +203,68 @@ void udp_client_init() {
 }
 ```
 
-#### 1.3 数据发送
+#### 1.3 数据帧结构定义
+```c
+// 90字节数据帧结构
+typedef struct __attribute__((packed)) {
+    uint8_t header[2];          // 0xAA 0x55
+    uint8_t device_id;          // 1=arm(ICM42688), 2=torso(BMI160)
+    uint8_t reserved;           // 保留字节
+    uint32_t timestamp_ms;      // 时间戳毫秒
+    float quat_torso[4];        // 躯干四元数 w,x,y,z
+    float quat_arm[4];          // 手臂四元数 w,x,y,z
+    float acc_torso[3];         // 躯干加速度 ax,ay,az (g)
+    float gyro_torso[3];        // 躯干角速度 gx,gy,gz (rad/s)
+    float acc_arm[3];           // 手臂加速度 ax,ay,az (g)
+    float gyro_arm[3];          // 手臂角速度 gx,gy,gz (rad/s)
+    uint16_t crc16;             // CRC-16/MODBUS
+} imu_data_frame_t;  // 总计90字节
+```
+
+#### 1.4 单IMU数据发送
 ```c
 void send_imu_data_via_udp(
-    const ImuSample &arm_sample,
-    const ImuSample &torso_sample,
-    const MadgwickFilterExtended &arm_filter,
-    const MadgwickFilterExtended &torso_filter,
-    uint32_t timestamp_ms
+    const ImuSample &sample,
+    const MadgwickFilterExtended &filter,
+    uint32_t timestamp_ms,
+    uint8_t device_id  // 1=ICM42688(arm), 2=BMI160(torso)
 ) {
     if (udp_socket < 0) {
         return;  // Socket未初始化
     }
 
-    // 构建数据帧（88字节）
+    // 构建数据帧（90字节）
     imu_data_frame_t frame;
+    memset(&frame, 0, sizeof(frame));  // 先清零所有字段
+
     frame.header[0] = 0xAA;
     frame.header[1] = 0x55;
+    frame.device_id = device_id;
+    frame.reserved = 0;
     frame.timestamp_ms = timestamp_ms;
 
-    torso_filter.get_quaternion_array(frame.quat_torso);
-    arm_filter.get_quaternion_array(frame.quat_arm);
-
-    frame.torso_accel[0] = torso_sample.ax;
-    frame.torso_accel[1] = torso_sample.ay;
-    frame.torso_accel[2] = torso_sample.az;
-    frame.torso_gyro[0] = torso_sample.gx;
-    frame.torso_gyro[1] = torso_sample.gy;
-    frame.torso_gyro[2] = torso_sample.gz;
-
-    frame.arm_accel[0] = arm_sample.ax;
-    frame.arm_accel[1] = arm_sample.ay;
-    frame.arm_accel[2] = arm_sample.az;
-    frame.arm_gyro[0] = arm_sample.gx;
-    frame.arm_gyro[1] = arm_sample.gy;
-    frame.arm_gyro[2] = arm_sample.gz;
+    // 根据device_id填充对应字段
+    if (device_id == 1) {
+        // ICM42688 -> arm字段
+        filter.get_quaternion_array(frame.quat_arm);
+        frame.acc_arm[0] = sample.ax;
+        frame.acc_arm[1] = sample.ay;
+        frame.acc_arm[2] = sample.az;
+        frame.gyro_arm[0] = sample.gx;
+        frame.gyro_arm[1] = sample.gy;
+        frame.gyro_arm[2] = sample.gz;
+        // torso字段保持为0
+    } else if (device_id == 2) {
+        // BMI160 -> torso字段
+        filter.get_quaternion_array(frame.quat_torso);
+        frame.acc_torso[0] = sample.ax;
+        frame.acc_torso[1] = sample.ay;
+        frame.acc_torso[2] = sample.az;
+        frame.gyro_torso[0] = sample.gx;
+        frame.gyro_torso[1] = sample.gy;
+        frame.gyro_torso[2] = sample.gz;
+        // arm字段保持为0
+    }
 
     frame.crc16 = calculate_crc16((uint8_t*)&frame, sizeof(frame) - 2);
 
@@ -230,10 +291,25 @@ void send_imu_data_via_udp(
 }
 ```
 
-#### 1.4 主循环集成
+#### 1.5 主循环集成
 ```c
 extern "C" void app_main(void) {
-    // ... IMU初始化 ...
+    // IMU初始化
+    uint8_t device_id = 0;
+    ImuSample sample;
+    MadgwickFilterExtended filter(0.3f, 0.01f);  // Beta=0.3, dt=10ms
+
+    // 自动检测IMU传感器
+    if (icm42688_init() == ESP_OK) {
+        device_id = 1;  // ICM42688 -> arm
+        ESP_LOGI(TAG, "ICM42688 detected, device_id=1 (arm)");
+    } else if (bmi160_init() == ESP_OK) {
+        device_id = 2;  // BMI160 -> torso
+        ESP_LOGI(TAG, "BMI160 detected, device_id=2 (torso)");
+    } else {
+        ESP_LOGE(TAG, "No IMU sensor detected!");
+        return;
+    }
 
     // WiFi初始化
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -246,14 +322,24 @@ extern "C" void app_main(void) {
     udp_client_init();
 
     // 主循环
+    uint32_t timestamp_ms = 0;
     while (true) {
-        // ... IMU采样和姿态解算 ...
+        // IMU采样
+        if (device_id == 1) {
+            icm42688_read_sample(&sample);
+        } else {
+            bmi160_read_sample(&sample);
+        }
+
+        // 姿态解算
+        filter.update(sample.gx, sample.gy, sample.gz,
+                     sample.ax, sample.ay, sample.az);
 
         // 通过UDP发送
-        send_imu_data_via_udp(arm_sample, torso_sample,
-                              arm_filter, torso_filter, timestamp_ms);
+        send_imu_data_via_udp(sample, filter, timestamp_ms, device_id);
 
-        vTaskDelay(SAMPLE_PERIOD_TICKS);  // 20ms = 50Hz
+        timestamp_ms += 10;
+        vTaskDelay(pdMS_TO_TICKS(10));  // 10ms = 100Hz
     }
 }
 ```
@@ -420,6 +506,13 @@ void udp_server_task(void *pvParameters) {
                 continue;
             }
 
+            // 检查device_id并处理数据
+            if (frame.device_id == 1) {
+                ESP_LOGI(TAG, "Received arm data (ICM42688)");
+            } else if (frame.device_id == 2) {
+                ESP_LOGI(TAG, "Received torso data (BMI160)");
+            }
+
             // 数据处理
             process_imu_data(&frame);
 
@@ -435,29 +528,55 @@ void udp_server_task(void *pvParameters) {
 #### 3.3 数据处理
 ```c
 void process_imu_data(const imu_data_frame_t *frame) {
-    // 提取四元数
-    float quat_torso[4] = {
-        frame->quat_torso[0],  // w
-        frame->quat_torso[1],  // x
-        frame->quat_torso[2],  // y
-        frame->quat_torso[3]   // z
-    };
+    // 根据device_id处理对应数据
+    if (frame->device_id == 1) {
+        // ICM42688数据在arm字段
+        float quat_arm[4] = {
+            frame->quat_arm[0],  // w
+            frame->quat_arm[1],  // x
+            frame->quat_arm[2],  // y
+            frame->quat_arm[3]   // z
+        };
 
-    float quat_arm[4] = {
-        frame->quat_arm[0],
-        frame->quat_arm[1],
-        frame->quat_arm[2],
-        frame->quat_arm[3]
-    };
+        float arm_accel[3] = {
+            frame->acc_arm[0],
+            frame->acc_arm[1],
+            frame->acc_arm[2]
+        };
 
-    // 提取原始数据
-    float torso_accel[3] = {
-        frame->torso_accel[0],
-        frame->torso_accel[1],
-        frame->torso_accel[2]
-    };
+        float arm_gyro[3] = {
+            frame->gyro_arm[0],
+            frame->gyro_arm[1],
+            frame->gyro_arm[2]
+        };
 
-    // ... 后续处理：显示、存储、分析等 ...
+        // 处理arm数据...
+    } else if (frame->device_id == 2) {
+        // BMI160数据在torso字段
+        float quat_torso[4] = {
+            frame->quat_torso[0],  // w
+            frame->quat_torso[1],  // x
+            frame->quat_torso[2],  // y
+            frame->quat_torso[3]   // z
+        };
+
+        float torso_accel[3] = {
+            frame->acc_torso[0],
+            frame->acc_torso[1],
+            frame->acc_torso[2]
+        };
+
+        float torso_gyro[3] = {
+            frame->gyro_torso[0],
+            frame->gyro_torso[1],
+            frame->gyro_torso[2]
+        };
+
+        // 处理torso数据...
+    }
+
+    // 时间戳
+    uint32_t timestamp = frame->timestamp_ms;
 }
 ```
 
@@ -467,9 +586,9 @@ void process_imu_data(const imu_data_frame_t *frame) {
 
 ### 带宽需求
 ```
-数据帧大小：88字节
-发送频率：50Hz
-带宽需求：88 × 50 = 4.4 KB/s = 35.2 Kbps
+数据帧大小：90字节
+发送频率：100Hz
+带宽需求：90 × 100 = 9 KB/s = 72 Kbps
 ```
 
 ### WiFi性能
@@ -477,7 +596,7 @@ void process_imu_data(const imu_data_frame_t *frame) {
 WiFi 802.11n (2.4GHz)：
 - 理论速率：72 Mbps (单天线)
 - 实际吞吐：20-30 Mbps
-- 余量：570倍以上
+- 余量：280倍以上
 ```
 
 ### 延迟分析
@@ -543,10 +662,11 @@ esp_wifi_set_ps(WIFI_PS_MIN_MODEM);  // 最小省电模式
 ## 实施步骤
 
 ### 阶段1：S3端改造（3-4小时）
-1. 移除USB CDC相关代码
-2. 添加WiFi Station初始化
-3. 实现UDP Client发送
-4. 测试WiFi连接和数据发送
+1. 实现单IMU自动检测（ICM42688或BMI160）
+2. 添加WiFi Station初始化（静态IP: 192.168.4.2）
+3. 实现UDP Client发送（90字节数据帧）
+4. 根据检测到的传感器设置device_id
+5. 测试WiFi连接和数据发送
 
 ### 阶段2：C6固件烧录（1-2小时）
 1. 下载ESP-Hosted源码
@@ -557,8 +677,9 @@ esp_wifi_set_ps(WIFI_PS_MIN_MODEM);  // 最小省电模式
 ### 阶段3：P4端集成（4-5小时）
 1. 集成ESP-Hosted Host驱动
 2. 配置SDIO Host
-3. 实现UDP Server接收
-4. 数据解析和处理
+3. 实现UDP Server接收（端口8888）
+4. 根据device_id解析对应字段数据
+5. 数据处理和应用集成
 
 ### 阶段4：系统联调（2-3小时）
 1. 验证WiFi连接
@@ -638,21 +759,32 @@ esp_wifi_set_ps(WIFI_PS_MIN_MODEM);  // 最小省电模式
 ### 方案优势
 ✓ **官方支持**：ESP-Hosted是Espressif官方方案
 ✓ **成熟稳定**：经过大量项目验证
+✓ **单IMU灵活**：自动识别ICM42688或BMI160
 ✓ **无USB干扰**：完全避开USB问题
 ✓ **灵活扩展**：可以轻松添加其他网络功能
 ✓ **易于调试**：标准TCP/IP协议，工具丰富
 
 ### 性能指标
 - **延迟**：5-10ms
-- **带宽**：4.4 KB/s（实际可达MB/s级别）
+- **带宽**：9 KB/s（实际可达MB/s级别）
 - **丢包率**：<0.1%（良好环境）
+- **采样率**：100Hz
+- **数据帧**：90字节
 - **功耗**：中等（可通过省电模式优化）
 
 ### 适用场景
+✓ 单IMU自动识别系统
 ✓ 需要稳定可靠的数据传输
 ✓ 对延迟要求不是极致（<10ms可接受）
 ✓ 需要标准网络协议支持
 ✓ 未来可能需要扩展其他网络功能
+
+### 数据帧说明
+- **总大小**：90字节
+- **device_id**：1=ICM42688(arm), 2=BMI160(torso)
+- **单IMU模式**：未使用的字段用memset填0
+- **ICM42688**：填充quat_arm、acc_arm、gyro_arm
+- **BMI160**：填充quat_torso、acc_torso、gyro_torso
 
 ---
 
