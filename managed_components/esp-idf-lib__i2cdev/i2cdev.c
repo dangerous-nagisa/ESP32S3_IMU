@@ -211,6 +211,8 @@ esp_err_t i2c_dev_delete_mutex(i2c_dev_t *dev)
     ESP_LOGV(TAG, "[0x%02x at %d] Deleting device mutex and cleaning up resources", dev->addr, dev->port);
 
     // Remove device from bus if handle exists
+    // Save the handle state before clearing it for later ref_count logic
+    bool had_device_handle = (dev->dev_handle != NULL);
     if (dev->dev_handle)
     {
         ESP_LOGV(TAG, "[0x%02x at %d] Removing device handle %p from bus", dev->addr, dev->port, dev->dev_handle);
@@ -238,7 +240,7 @@ esp_err_t i2c_dev_delete_mutex(i2c_dev_t *dev)
         else if (xSemaphoreTake(i2c_ports[dev->port].lock, pdMS_TO_TICKS(CONFIG_I2CDEV_TIMEOUT)) == pdTRUE)
         {
             // Only decrement ref_count if THIS device was actually added to the bus
-            if (i2c_ports[dev->port].installed && i2c_ports[dev->port].ref_count > 0 && dev->dev_handle != NULL)
+            if (i2c_ports[dev->port].installed && i2c_ports[dev->port].ref_count > 0 && had_device_handle)
             {
                 i2c_ports[dev->port].ref_count--;
                 ESP_LOGV(TAG, "[Port %d] Decremented ref_count to %" PRIu32, dev->port, i2c_ports[dev->port].ref_count);
@@ -263,7 +265,7 @@ esp_err_t i2c_dev_delete_mutex(i2c_dev_t *dev)
                     i2c_ports[dev->port].scl_pin_current = -1;
                 }
             }
-            else if (dev->dev_handle == NULL)
+            else if (!had_device_handle)
             {
                 ESP_LOGV(TAG, "[0x%02x at %d] Device was never added to bus, skipping ref_count decrement", dev->addr, dev->port);
             }

@@ -63,7 +63,8 @@ constexpr float DEG_TO_RAD = static_cast<float>(M_PI / 180.0);
 
 constexpr uint8_t ICM_I2C_ADDRESS = ICM42688_I2C_ADDRESS;
 constexpr uint8_t BMI_I2C_ADDRESS = BMI160_I2C_ADDRESS_VDD;
-constexpr uint8_t ICM_EXPECTED_DEVICE_ID = 0x47;
+constexpr uint8_t ICM_DEVICE_ID_1 = 0x47;  // ICM42688 device ID variant 1
+constexpr uint8_t ICM_DEVICE_ID_2 = 0x7B;  // ICM42688 device ID variant 2
 constexpr int IMU_INIT_MAX_RETRIES = 5;
 constexpr int IMU_RUNTIME_RECOVER_RETRIES = 5;
 constexpr int64_t IMU_RECOVER_COOLDOWN_US = 300 * 1000;
@@ -102,16 +103,33 @@ struct GyroBias {
     float z;
 };
 
-// USB CDC数据帧结构（88字节�?
+// IMU类型枚举
+enum class ImuType : uint8_t {
+    NONE = 0,
+    ICM42688 = 1,  // arm (I2C0)
+    BMI160 = 2     // torso (I2C1)
+};
+
+// 检测到的IMU信息
+struct DetectedImu {
+    ImuType type;
+    i2c_port_t port;
+    gpio_num_t sda;
+    gpio_num_t scl;
+};
+
+// USB CDC数据帧结构（90字节）
 typedef struct __attribute__((packed)) {
     uint8_t header[2];          // 0xAA 0x55
+    uint8_t device_id;          // 1=arm(ICM42688), 2=torso(BMI160)
+    uint8_t reserved;           // Reserved byte
     uint32_t timestamp_ms;      // 时间戳毫�?
     float quat_torso[4];        // 躯干四元�?w,x,y,z
     float quat_arm[4];          // 手臂四元�?w,x,y,z
-    float torso_accel[3];       // 躯干加速度 ax,ay,az (g)
-    float torso_gyro[3];        // 躯干角速度 gx,gy,gz (rad/s)
-    float arm_accel[3];         // 手臂加速度 ax,ay,az (g)
-    float arm_gyro[3];          // 手臂角速度 gx,gy,gz (rad/s)
+    float acc_torso[3];         // 躯干加速度 ax,ay,az (g)
+    float gyro_torso[3];        // 躯干角速度 gx,gy,gz (rad/s)
+    float acc_arm[3];           // 手臂加速度 ax,ay,az (g)
+    float gyro_arm[3];          // 手臂角速度 gx,gy,gz (rad/s)
     uint16_t crc16;             // CRC-16/MODBUS
 } imu_data_frame_t;
 
@@ -327,8 +345,103 @@ esp_err_t init_udp_client() {
     return ESP_OK;
 }
 
-// 通过UDP发送IMU数据（线程安全版本）
-void send_imu_data_via_udp(
+// 通过UDP发送单IMU数据（线程安全版本）
+void send_single_imu_data_via_udp(
+    ImuType imu_type,
+    const ImuSample &sample,
+    const MadgwickFilterExtended &filter,
+    uint32_t timestamp_ms
+) {
+    // 使用EventGroup检查WiFi连接状态
+    EventBits_t bits = xEventGroupGetBits(wifi_event_group);
+    if (!(bits & WIFI_CONNECTED_BIT) || udp_socket < 0) {
+        static uint32_t warn_count = 0;
+        if (++warn_count % 100 == 1) {
+            ESP_LOGW(TAG, "WiFi not connected or socket invalid (warnings: %lu)", warn_count);
+        }
+        return;
+    }
+
+    // 构建数据帧
+    imu_data_frame_t frame;
+    frame.header[0] = 0xAA;
+    frame.header[1] = 0x55;
+    frame.device_id = static_cast<uint8_t>(imu_type);
+    frame.reserved = 0;
+    frame.timestamp_ms = timestamp_ms;
+
+    // 获取四元数
+    float quat[4];
+    filter.get_quaternion_array(quat);
+
+    // 根据IMU类型填充数据
+    if (imu_type == ImuType::ICM42688) {
+        // 填充arm数据
+        for (int i = 0; i < 4; i++) frame.quat_arm[i] = quat[i];
+        frame.acc_arm[0] = sample.ax;
+        frame.acc_arm[1] = sample.ay;
+        frame.acc_arm[2] = sample.az;
+        frame.gyro_arm[0] = sample.gx;
+        frame.gyro_arm[1] = sample.gy;
+        frame.gyro_arm[2] = sample.gz;
+        // torso数据填零
+        std::memset(frame.quat_torso, 0, sizeof(frame.quat_torso));
+        std::memset(frame.acc_torso, 0, sizeof(frame.acc_torso));
+        std::memset(frame.gyro_torso, 0, sizeof(frame.gyro_torso));
+    } else if (imu_type == ImuType::BMI160) {
+        // 填充torso数据
+        for (int i = 0; i < 4; i++) frame.quat_torso[i] = quat[i];
+        frame.acc_torso[0] = sample.ax;
+        frame.acc_torso[1] = sample.ay;
+        frame.acc_torso[2] = sample.az;
+        frame.gyro_torso[0] = sample.gx;
+        frame.gyro_torso[1] = sample.gy;
+        frame.gyro_torso[2] = sample.gz;
+        // arm数据填零
+        std::memset(frame.quat_arm, 0, sizeof(frame.quat_arm));
+        std::memset(frame.acc_arm, 0, sizeof(frame.acc_arm));
+        std::memset(frame.gyro_arm, 0, sizeof(frame.gyro_arm));
+    }
+
+    // 计算CRC
+    frame.crc16 = calculate_crc16((uint8_t*)&frame, sizeof(frame) - 2);
+
+    // 拷贝目标地址到局部变量
+    struct sockaddr_in local_dest_addr;
+    if (dest_addr_mutex && xSemaphoreTake(dest_addr_mutex, 0) == pdTRUE) {
+        local_dest_addr = dest_addr;
+        xSemaphoreGive(dest_addr_mutex);
+    } else {
+        local_dest_addr.sin_addr.s_addr = inet_addr(UDP_SERVER_IP);
+        local_dest_addr.sin_family = AF_INET;
+        local_dest_addr.sin_port = htons(UDP_SERVER_PORT);
+    }
+
+    // UDP发送
+    int sent = sendto(udp_socket, &frame, sizeof(frame), 0,
+                      (struct sockaddr*)&local_dest_addr, sizeof(local_dest_addr));
+
+    static uint32_t send_count = 0;
+    static uint32_t error_count = 0;
+
+    if (sent < 0) {
+        error_count++;
+        if (error_count % 100 == 1) {
+            ESP_LOGW(TAG, "UDP send failed: errno %d (total errors: %lu)", errno, error_count);
+        }
+    } else if (sent != sizeof(frame)) {
+        error_count++;
+        ESP_LOGW(TAG, "UDP partial send: %d/%d bytes", sent, sizeof(frame));
+    } else {
+        send_count++;
+        if (send_count % 100 == 0) {
+            ESP_LOGI(TAG, "UDP sent %lu frames (errors: %lu)", send_count, error_count);
+        }
+    }
+}
+
+// 通过UDP发送IMU数据（线程安全版本，双IMU模式保留）
+[[maybe_unused]] void send_imu_data_via_udp(
     const ImuSample &arm_sample,
     const ImuSample &torso_sample,
     const MadgwickFilterExtended &arm_filter,
@@ -349,6 +462,8 @@ void send_imu_data_via_udp(
     imu_data_frame_t frame;
     frame.header[0] = 0xAA;
     frame.header[1] = 0x55;
+    frame.device_id = 0;  // 双IMU模式
+    frame.reserved = 0;
     frame.timestamp_ms = timestamp_ms;
 
     // 使用临时数组避免packed结构未对齐访�?
@@ -362,19 +477,19 @@ void send_imu_data_via_udp(
         frame.quat_arm[i] = arm_quat_temp[i];
     }
 
-    frame.torso_accel[0] = torso_sample.ax;
-    frame.torso_accel[1] = torso_sample.ay;
-    frame.torso_accel[2] = torso_sample.az;
-    frame.torso_gyro[0] = torso_sample.gx;
-    frame.torso_gyro[1] = torso_sample.gy;
-    frame.torso_gyro[2] = torso_sample.gz;
+    frame.acc_torso[0] = torso_sample.ax;
+    frame.acc_torso[1] = torso_sample.ay;
+    frame.acc_torso[2] = torso_sample.az;
+    frame.gyro_torso[0] = torso_sample.gx;
+    frame.gyro_torso[1] = torso_sample.gy;
+    frame.gyro_torso[2] = torso_sample.gz;
 
-    frame.arm_accel[0] = arm_sample.ax;
-    frame.arm_accel[1] = arm_sample.ay;
-    frame.arm_accel[2] = arm_sample.az;
-    frame.arm_gyro[0] = arm_sample.gx;
-    frame.arm_gyro[1] = arm_sample.gy;
-    frame.arm_gyro[2] = arm_sample.gz;
+    frame.acc_arm[0] = arm_sample.ax;
+    frame.acc_arm[1] = arm_sample.ay;
+    frame.acc_arm[2] = arm_sample.az;
+    frame.gyro_arm[0] = arm_sample.gx;
+    frame.gyro_arm[1] = arm_sample.gy;
+    frame.gyro_arm[2] = arm_sample.gz;
 
     frame.crc16 = calculate_crc16((uint8_t*)&frame, sizeof(frame) - 2);
 
@@ -467,6 +582,9 @@ struct Bmi160Context {
     bmi160_t sensor {};
 };
 
+esp_err_t init_icm42688(Icm42688Context *ctx);
+esp_err_t init_bmi160(Bmi160Context *ctx);
+
 bool should_attempt_imu_recover(esp_err_t err) {
     return err == ESP_ERR_INVALID_STATE ||
            err == ESP_ERR_TIMEOUT ||
@@ -508,11 +626,13 @@ esp_err_t verify_icm_device_id(icm42688_handle_t sensor) {
     if (ret != ESP_OK) {
         return ret;
     }
-    if (dev_id != ICM_EXPECTED_DEVICE_ID) {
-        ESP_LOGE(TAG, "ICM42688 device ID mismatch: 0x%02X (expected 0x%02X)",
-                 dev_id, ICM_EXPECTED_DEVICE_ID);
+    // 支持两个有效的device ID
+    if (dev_id != ICM_DEVICE_ID_1 && dev_id != ICM_DEVICE_ID_2) {
+        ESP_LOGE(TAG, "ICM42688 device ID mismatch: 0x%02X (expected 0x%02X or 0x%02X)",
+                 dev_id, ICM_DEVICE_ID_1, ICM_DEVICE_ID_2);
         return ESP_ERR_NOT_FOUND;
     }
+    ESP_LOGI(TAG, "ICM42688 device ID verified: 0x%02X", dev_id);
     return ESP_OK;
 }
 
@@ -581,6 +701,64 @@ esp_err_t init_icm_bus(i2c_master_bus_handle_t *bus) {
     return i2c_new_master_bus(&bus_config, bus);
 }
 
+// IMU轻量级检测函数 - 只读chip id，不做完整初始化
+DetectedImu detect_available_imu() {
+    DetectedImu result = {ImuType::NONE, I2C_NUM_0, GPIO_NUM_8, GPIO_NUM_9};
+
+    // 1. 尝试检测I2C0上的ICM42688
+    ESP_LOGI(TAG, "Detecting IMU on I2C0 (GPIO8/9)...");
+    i2c_master_bus_handle_t icm_bus = nullptr;
+    if (init_icm_bus(&icm_bus) == ESP_OK) {
+        icm42688_handle_t icm_sensor = nullptr;
+        esp_err_t create_ret = icm42688_create(icm_bus, ICM_I2C_ADDRESS, &icm_sensor);
+        if (create_ret == ESP_OK || (create_ret == ESP_ERR_INVALID_STATE && icm_sensor != nullptr)) {
+            uint8_t dev_id = 0;
+            if (icm42688_get_deviceid(icm_sensor, &dev_id) == ESP_OK &&
+                (dev_id == ICM_DEVICE_ID_1 || dev_id == ICM_DEVICE_ID_2)) {
+                ESP_LOGI(TAG, "Detected ICM42688 on I2C0 (chip_id=0x%02X)", dev_id);
+                icm42688_delete(icm_sensor);  // 修复：传句柄本身，不是地址
+                i2c_del_master_bus(icm_bus);
+                result.type = ImuType::ICM42688;
+                result.port = I2C_NUM_0;
+                result.sda = GPIO_NUM_8;
+                result.scl = GPIO_NUM_9;
+                return result;
+            }
+            icm42688_delete(icm_sensor);  // 修复：传句柄本身，不是地址
+        }
+        i2c_del_master_bus(icm_bus);
+    }
+    ESP_LOGW(TAG, "No ICM42688 found on I2C0");
+
+    // 2. 尝试检测I2C1上的BMI160 - 只使用0x69地址
+    ESP_LOGI(TAG, "Detecting IMU on I2C1 (GPIO16/17)...");
+
+    // 初始化i2cdev（BMI160依赖）
+    if (i2cdev_init() == ESP_OK) {
+        bmi160_t bmi_test = {};
+
+        // 只尝试0x69地址（VDD）- 硬件确定使用此地址
+        esp_err_t ret = bmi160_init(&bmi_test, BMI160_I2C_ADDRESS_VDD, BMI_I2C_PORT, BMI_I2C_SDA, BMI_I2C_SCL);
+        if (ret == ESP_OK) {
+            uint8_t chip_id = 0;
+            if (bmi160_read_reg(&bmi_test, 0x00, &chip_id) == ESP_OK && chip_id == 0xD1) {
+                ESP_LOGI(TAG, "Detected BMI160 on I2C1 at 0x69 (chip_id=0x%02X)", chip_id);
+                bmi160_free(&bmi_test);
+                result.type = ImuType::BMI160;
+                result.port = static_cast<i2c_port_t>(I2C_NUM_1);
+                result.sda = GPIO_NUM_16;
+                result.scl = GPIO_NUM_17;
+                return result;
+            }
+            bmi160_free(&bmi_test);
+        }
+    }
+    ESP_LOGW(TAG, "No BMI160 found on I2C1");
+
+    ESP_LOGE(TAG, "No IMU detected on either I2C bus!");
+    return result;
+}
+
 esp_err_t init_icm42688(Icm42688Context *ctx) {
     if (ctx == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -620,7 +798,7 @@ esp_err_t init_icm42688(Icm42688Context *ctx) {
     return ESP_OK;
 }
 
-esp_err_t init_bmi160(Bmi160Context *ctx) {
+esp_err_t init_bmi160_at_address(Bmi160Context *ctx, uint8_t address) {
     if (ctx == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -628,13 +806,14 @@ esp_err_t init_bmi160(Bmi160Context *ctx) {
     ESP_RETURN_ON_ERROR(i2cdev_init(), TAG, "failed to init i2cdev");
     std::memset(&ctx->sensor, 0, sizeof(ctx->sensor));
 
-    ESP_RETURN_ON_ERROR(bmi160_init(&ctx->sensor, BMI_I2C_ADDRESS, BMI_I2C_PORT, BMI_I2C_SDA, BMI_I2C_SCL), TAG,
+    ESP_RETURN_ON_ERROR(bmi160_init(&ctx->sensor, address, BMI_I2C_PORT, BMI_I2C_SDA, BMI_I2C_SCL), TAG,
                         "failed to init BMI160");
 
     // Software reset to ensure known state
+    ESP_LOGI(TAG, "BMI160 performing soft reset...");
     ESP_RETURN_ON_ERROR(bmi160_write_reg(&ctx->sensor, 0x7E, 0xB6), TAG,
                         "failed to soft-reset BMI160");
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(300));  // 增加到300ms，确保复位完成
 
     // Verify chip ID
     uint8_t chip_id = 0;
@@ -646,8 +825,52 @@ esp_err_t init_bmi160(Bmi160Context *ctx) {
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    ESP_RETURN_ON_ERROR(bmi160_switch_mode(&ctx->sensor, BMI160_PMU_ACC_NORMAL, BMI160_PMU_GYR_NORMAL), TAG,
-                        "failed to switch BMI160 mode");
+    auto wait_bmi160_pmu = [&](uint8_t mask, uint8_t expected, uint8_t shift, const char *name) -> esp_err_t {
+        for (int i = 0; i < 50; ++i) {  // 增加到50次，最多1000ms
+            uint8_t pmu = 0;
+            esp_err_t ret = bmi160_read_reg(&ctx->sensor, 0x03, &pmu);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "BMI160 %s PMU read failed: %s", name, esp_err_to_name(ret));
+                return ret;
+            }
+            uint8_t actual = (pmu & mask) >> shift;
+            if (i % 5 == 0) {  // 每100ms打印一次
+                ESP_LOGI(TAG, "BMI160 %s PMU polling: actual=0x%02X expect=0x%02X (raw=0x%02X)",
+                         name, actual, expected, pmu);
+            }
+            if (actual == expected) {
+                ESP_LOGI(TAG, "BMI160 %s PMU ready after %d ms", name, i * 20);
+                return ESP_OK;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+
+        uint8_t pmu = 0;
+        uint8_t err = 0;
+        bmi160_read_reg(&ctx->sensor, 0x03, &pmu);  // PMU_STATUS
+        bmi160_read_reg(&ctx->sensor, 0x02, &err);  // ERR_REG
+        ESP_LOGE(TAG, "BMI160 %s PMU wait timeout: PMU=0x%02X ERR=0x%02X", name, pmu, err);
+        return ESP_ERR_TIMEOUT;
+    };
+
+    // 使用显式命令+轮询，比库内一次性检查更稳健
+    ESP_LOGI(TAG, "BMI160 setting accel to NORMAL mode...");
+    ESP_RETURN_ON_ERROR(bmi160_write_reg(&ctx->sensor, 0x7E, BMI160_PMU_ACC_NORMAL), TAG,
+                        "failed to set BMI160 accel normal mode");
+    ESP_RETURN_ON_ERROR(wait_bmi160_pmu(0x30, 0x01, 4, "ACC"), TAG,
+                        "failed to wait BMI160 accel PMU");
+
+    // 尝试先设置陀螺仪为FAST_STARTUP，再切到NORMAL（某些芯片需要这个步骤）
+    ESP_LOGI(TAG, "BMI160 setting gyro to FAST_STARTUP mode...");
+    ESP_RETURN_ON_ERROR(bmi160_write_reg(&ctx->sensor, 0x7E, 0x17), TAG,  // FAST_STARTUP
+                        "failed to set BMI160 gyro fast startup mode");
+    vTaskDelay(pdMS_TO_TICKS(100));  // 等待FAST_STARTUP完成
+
+    ESP_LOGI(TAG, "BMI160 setting gyro to NORMAL mode...");
+    ESP_RETURN_ON_ERROR(bmi160_write_reg(&ctx->sensor, 0x7E, BMI160_PMU_GYR_NORMAL), TAG,
+                        "failed to set BMI160 gyro normal mode");
+    ESP_RETURN_ON_ERROR(wait_bmi160_pmu(0x0C, 0x01, 2, "GYR"), TAG,
+                        "failed to wait BMI160 gyro PMU");
     vTaskDelay(pdMS_TO_TICKS(50));
 
     ESP_RETURN_ON_ERROR(bmi160_set_acc_range(&ctx->sensor, BMI160_ACC_RANGE_4G), TAG,
@@ -669,8 +892,24 @@ esp_err_t init_bmi160(Bmi160Context *ctx) {
     ESP_LOGI(TAG, "BMI160 config readback: ACC_RANGE=0x%02X GYR_RANGE=0x%02X ACC_CONF=0x%02X GYR_CONF=0x%02X PMU=0x%02X",
              acc_range_reg, gyr_range_reg, acc_conf_reg, gyr_conf_reg, pmu_status);
     ESP_LOGI(TAG, "BMI160 aRes=%e gRes=%e", ctx->sensor.aRes, ctx->sensor.gRes);
+    ESP_LOGI(TAG, "BMI160 initialized at address 0x%02X", address);
 
     return ESP_OK;
+}
+
+esp_err_t init_bmi160(Bmi160Context *ctx) {
+    if (ctx == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 初始化阶段仅使用工程已确认地址，避免在错误地址上反复重建句柄污染总线状态
+    ESP_LOGI(TAG, "Trying BMI160 address 0x%02X on I2C%d (SDA=%d SCL=%d)",
+             BMI_I2C_ADDRESS, BMI_I2C_PORT, BMI_I2C_SDA, BMI_I2C_SCL);
+    esp_err_t ret = init_bmi160_at_address(ctx, BMI_I2C_ADDRESS);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "BMI160 init failed at 0x%02X: %s", BMI_I2C_ADDRESS, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 esp_err_t init_icm42688_with_retry(Icm42688Context *ctx, int max_retries) {
@@ -1013,87 +1252,111 @@ extern "C" void app_main(void) {
     xTaskCreate(rgb_led_blink_task, "rgb_blink", 2048, NULL, 1, NULL);
     ESP_LOGI(TAG, "RGB LED initialized on GPIO%d", RGB_LED_GPIO);
 
-    i2c_master_bus_handle_t scan_bus0 = nullptr;
-    i2c_master_bus_handle_t scan_bus1 = nullptr;
+    // 注释掉启动扫描，避免无设备时产生大量超时干扰诊断
+    // i2c_master_bus_handle_t scan_bus0 = nullptr;
+    // i2c_master_bus_handle_t scan_bus1 = nullptr;
+    //
+    // if (init_scan_bus(static_cast<i2c_port_t>(ICM_I2C_PORT), ICM_I2C_SDA, ICM_I2C_SCL, &scan_bus0) == ESP_OK) {
+    //     scan_i2c_bus(scan_bus0, "scan/icm_bus");
+    //     i2c_del_master_bus(scan_bus0);
+    //     vTaskDelay(IMU_BUS_SETTLE_TICKS);
+    // } else {
+    //     ESP_LOGW(TAG, "failed to create scan bus for ICM bus");
+    // }
+    //
+    // if (init_scan_bus(BMI_I2C_PORT, BMI_I2C_SDA, BMI_I2C_SCL, &scan_bus1) == ESP_OK) {
+    //     scan_i2c_bus(scan_bus1, "scan/bmi_bus");
+    //     i2c_del_master_bus(scan_bus1);
+    //     vTaskDelay(IMU_BUS_SETTLE_TICKS);
+    // } else {
+    //     ESP_LOGW(TAG, "failed to create scan bus for BMI bus");
+    // }
 
-    if (init_scan_bus(static_cast<i2c_port_t>(ICM_I2C_PORT), ICM_I2C_SDA, ICM_I2C_SCL, &scan_bus0) == ESP_OK) {
-        scan_i2c_bus(scan_bus0, "scan/icm_bus");
-        i2c_del_master_bus(scan_bus0);
-        vTaskDelay(IMU_BUS_SETTLE_TICKS);
-    } else {
-        ESP_LOGW(TAG, "failed to create scan bus for ICM bus");
-    }
-
-    if (init_scan_bus(BMI_I2C_PORT, BMI_I2C_SDA, BMI_I2C_SCL, &scan_bus1) == ESP_OK) {
-        scan_i2c_bus(scan_bus1, "scan/bmi_bus");
-        i2c_del_master_bus(scan_bus1);
-        vTaskDelay(IMU_BUS_SETTLE_TICKS);
-    } else {
-        ESP_LOGW(TAG, "failed to create scan bus for BMI bus");
+    // 自动检测IMU
+    DetectedImu detected = detect_available_imu();
+    const bool imu_detected = (detected.type != ImuType::NONE);
+    ImuType runtime_imu_type = ImuType::NONE;
+    if (!imu_detected) {
+        ESP_LOGE(TAG, "No IMU detected, continue in network-only degraded mode");
     }
 
     Icm42688Context icm {};
     Bmi160Context bmi {};
+    MadgwickFilterExtended filter(MADGWICK_BETA_RUN);
+    GyroBias gyro_bias {};
 
-    ESP_ERROR_CHECK(init_icm42688_with_retry(&icm, IMU_INIT_MAX_RETRIES));
-    ESP_LOGI(TAG, "ICM-42688 init success on I2C%d SDA=%d SCL=%d", ICM_I2C_PORT, ICM_I2C_SDA, ICM_I2C_SCL);
-
-    ESP_ERROR_CHECK(init_bmi160_with_retry(&bmi, IMU_INIT_MAX_RETRIES));
-    ESP_LOGI(TAG, "BMI160 init success on I2C%d SDA=%d SCL=%d", BMI_I2C_PORT, BMI_I2C_SDA, BMI_I2C_SCL);
-
-    // Dump raw BMI160 data for diagnosis
-    dump_bmi160_raw(&bmi, 20);
-
-    MadgwickFilterExtended arm_filter(MADGWICK_BETA_RUN);
-    MadgwickFilterExtended torso_filter(MADGWICK_BETA_RUN);
-
-    ESP_LOGI(TAG, "Warm up IMUs for %lu ms before calibration, keep devices still",
-             static_cast<unsigned long>(CALIBRATION_WARMUP_TICKS * portTICK_PERIOD_MS));
-    vTaskDelay(CALIBRATION_WARMUP_TICKS);
-
-    GyroBias icm_gyro_bias {};
-    GyroBias bmi_gyro_bias {};
-    esp_err_t icm_cal_ret = ESP_FAIL;
-    esp_err_t bmi_cal_ret = ESP_FAIL;
-    bool icm_filter_init = false;
-    bool bmi_filter_init = false;
-
-    for (int attempt = 1; attempt <= STARTUP_CALIBRATION_MAX_ATTEMPTS; ++attempt) {
-        ESP_LOGI(TAG, "Startup calibration attempt %d/%d", attempt, STARTUP_CALIBRATION_MAX_ATTEMPTS);
-        icm_filter_init = false;
-        bmi_filter_init = false;
-
-        icm_cal_ret = calibrate_icm42688_gyro(icm, &icm_gyro_bias);
-        bmi_cal_ret = calibrate_bmi160_gyro(&bmi, &bmi_gyro_bias);
-
-        if (icm_cal_ret == ESP_OK && bmi_cal_ret == ESP_OK) {
-            icm_filter_init = initialize_filter_from_icm(&arm_filter, icm, icm_gyro_bias);
-            bmi_filter_init = initialize_filter_from_bmi(&torso_filter, &bmi, bmi_gyro_bias);
-            if (icm_filter_init && bmi_filter_init) {
-                break;
+    if (imu_detected) {
+        if (detected.type == ImuType::ICM42688) {
+            ESP_LOGI(TAG, "Initializing ICM42688 system (device_id=1)");
+            esp_err_t init_ret = init_icm42688_with_retry(&icm, IMU_INIT_MAX_RETRIES);
+            if (init_ret == ESP_OK) {
+                runtime_imu_type = ImuType::ICM42688;
+                ESP_LOGI(TAG, "ICM42688 init success on I2C%d SDA=%d SCL=%d", ICM_I2C_PORT, ICM_I2C_SDA, ICM_I2C_SCL);
+            } else {
+                ESP_LOGE(TAG, "ICM42688 init failed after retries: %s, degrade to network-only",
+                         esp_err_to_name(init_ret));
             }
-        }
-
-        ESP_LOGW(TAG, "Startup calibration/init attempt %d failed: icm_cal=%s bmi_cal=%s icm_filter=%d bmi_filter=%d",
-                 attempt, esp_err_to_name(icm_cal_ret), esp_err_to_name(bmi_cal_ret),
-                 icm_filter_init ? 1 : 0, bmi_filter_init ? 1 : 0);
-
-        if (attempt < STARTUP_CALIBRATION_MAX_ATTEMPTS) {
-            vTaskDelay(STARTUP_CALIBRATION_RETRY_DELAY_TICKS);
+        } else if (detected.type == ImuType::BMI160) {
+            ESP_LOGI(TAG, "Initializing BMI160 system (device_id=2)");
+            esp_err_t init_ret = init_bmi160_with_retry(&bmi, IMU_INIT_MAX_RETRIES);
+            if (init_ret == ESP_OK) {
+                runtime_imu_type = ImuType::BMI160;
+                ESP_LOGI(TAG, "BMI160 init success on I2C%d SDA=%d SCL=%d", BMI_I2C_PORT, BMI_I2C_SDA, BMI_I2C_SCL);
+                dump_bmi160_raw(&bmi, 20);
+            } else {
+                ESP_LOGE(TAG, "BMI160 init failed after retries: %s, degrade to network-only",
+                         esp_err_to_name(init_ret));
+            }
         }
     }
 
-    if (!icm_filter_init || !bmi_filter_init) {
-        ESP_LOGE(TAG, "Startup calibration/filter init incomplete, continue in degraded mode");
-        ESP_LOGE(TAG, "Final status: icm_cal=%s bmi_cal=%s icm_filter=%d bmi_filter=%d",
-                 esp_err_to_name(icm_cal_ret), esp_err_to_name(bmi_cal_ret),
-                 icm_filter_init ? 1 : 0, bmi_filter_init ? 1 : 0);
+    const bool imu_runtime_ready = (runtime_imu_type != ImuType::NONE);
 
-        // Keep running with zero bias and identity quaternion to avoid boot loop.
-        icm_gyro_bias = GyroBias{};
-        bmi_gyro_bias = GyroBias{};
-        arm_filter.set_quaternion(1.0f, 0.0f, 0.0f, 0.0f);
-        torso_filter.set_quaternion(1.0f, 0.0f, 0.0f, 0.0f);
+    if (imu_runtime_ready) {
+        ESP_LOGI(TAG, "Warm up IMU for %lu ms before calibration, keep device still",
+                 static_cast<unsigned long>(CALIBRATION_WARMUP_TICKS * portTICK_PERIOD_MS));
+        vTaskDelay(CALIBRATION_WARMUP_TICKS);
+
+        esp_err_t cal_ret = ESP_FAIL;
+        bool filter_init = false;
+
+        for (int attempt = 1; attempt <= STARTUP_CALIBRATION_MAX_ATTEMPTS; ++attempt) {
+            ESP_LOGI(TAG, "Startup calibration attempt %d/%d", attempt, STARTUP_CALIBRATION_MAX_ATTEMPTS);
+            filter_init = false;
+
+            if (runtime_imu_type == ImuType::ICM42688) {
+                cal_ret = calibrate_icm42688_gyro(icm, &gyro_bias);
+                if (cal_ret == ESP_OK) {
+                    filter_init = initialize_filter_from_icm(&filter, icm, gyro_bias);
+                }
+            } else if (runtime_imu_type == ImuType::BMI160) {
+                cal_ret = calibrate_bmi160_gyro(&bmi, &gyro_bias);
+                if (cal_ret == ESP_OK) {
+                    filter_init = initialize_filter_from_bmi(&filter, &bmi, gyro_bias);
+                }
+            }
+
+            if (filter_init) {
+                break;
+            }
+
+            ESP_LOGW(TAG, "Startup calibration/init attempt %d failed: cal=%s filter=%d",
+                     attempt, esp_err_to_name(cal_ret), filter_init ? 1 : 0);
+
+            if (attempt < STARTUP_CALIBRATION_MAX_ATTEMPTS) {
+                vTaskDelay(STARTUP_CALIBRATION_RETRY_DELAY_TICKS);
+            }
+        }
+
+        if (!filter_init) {
+            ESP_LOGE(TAG, "Startup calibration/filter init incomplete, continue in degraded mode");
+            gyro_bias = GyroBias{};
+            filter.set_quaternion(1.0f, 0.0f, 0.0f, 0.0f);
+        }
+    } else {
+        // 无IMU时保持姿态为单位四元数，主循环仅维持联网与任务存活
+        gyro_bias = GyroBias{};
+        filter.set_quaternion(1.0f, 0.0f, 0.0f, 0.0f);
     }
 
     ESP_LOGI(TAG, "Attitude initialization complete, entering normal output phase");
@@ -1119,104 +1382,94 @@ extern "C" void app_main(void) {
     // 初始化UDP Client
     ESP_ERROR_CHECK(init_udp_client());
 
-    int64_t last_tick_us = esp_timer_get_time();
-    int64_t last_bmi_update_us = last_tick_us;
-    int64_t last_icm_recover_us = 0;
-    int64_t last_bmi_recover_us = 0;
-    int icm_consecutive_failures = 0;
-    int bmi_consecutive_failures = 0;
-    uint32_t icm_error_total = 0;
-    uint32_t bmi_error_total = 0;
+    int64_t last_update_us = esp_timer_get_time();
+    int64_t last_recover_us = 0;
+    int consecutive_failures = 0;
+    uint32_t error_total = 0;
 
     while (true) {
-        const int64_t now_us = esp_timer_get_time();
-        float dt_s = static_cast<float>(now_us - last_tick_us) / 1000000.0f;
-        last_tick_us = now_us;
+        int64_t now_us = esp_timer_get_time();
+        float dt_s = static_cast<float>(now_us - last_update_us) / 1000000.0f;
+        last_update_us = now_us;
         if (dt_s <= 0.0f) {
             dt_s = 0.01f;
         }
 
-        ImuSample arm_sample {};
-        EulerAngles arm_euler {};
-        bool arm_euler_valid = false;
-        const esp_err_t icm_ret = read_icm42688_sample(icm, &arm_sample);
-        if (icm_ret != ESP_OK) {
-            icm_consecutive_failures++;
-            icm_error_total++;
-            if (icm_consecutive_failures == 1 || (icm_consecutive_failures % 10) == 0) {
-                ESP_LOGW(TAG, "failed to read ICM42688 sample: %s (consecutive=%d total=%lu)",
-                         esp_err_to_name(icm_ret), icm_consecutive_failures, icm_error_total);
+        ImuSample sample {};
+        EulerAngles euler {};
+        bool read_success = false;
+        esp_err_t read_ret = ESP_FAIL;
+
+        // 根据检测到的IMU类型读取数据
+        if (runtime_imu_type == ImuType::ICM42688) {
+            read_ret = read_icm42688_sample(icm, &sample);
+            if (read_ret == ESP_OK) {
+                apply_gyro_bias(&sample, gyro_bias);
+                euler = update_filter(&filter, sample, dt_s);
+                read_success = true;
             }
-            bool trigger_by_burst = icm_consecutive_failures >= IMU_RECOVER_TRIGGER_CONSECUTIVE_ERRORS;
-            bool trigger_by_cooldown = (now_us - last_icm_recover_us) >= IMU_RECOVER_COOLDOWN_US;
-            if (should_attempt_imu_recover(icm_ret) && (trigger_by_burst || trigger_by_cooldown)) {
-                last_icm_recover_us = now_us;
-                ESP_LOGW(TAG, "Attempting ICM42688 runtime recover (consecutive=%d)...", icm_consecutive_failures);
-                esp_err_t recover_ret = init_icm42688_with_retry(&icm, IMU_RUNTIME_RECOVER_RETRIES);
-                if (recover_ret == ESP_OK) {
-                    ESP_LOGI(TAG, "ICM42688 runtime recover success");
-                    icm_consecutive_failures = 0;
-                } else {
-                    ESP_LOGE(TAG, "ICM42688 runtime recover failed: %s", esp_err_to_name(recover_ret));
-                }
+        } else if (runtime_imu_type == ImuType::BMI160) {
+            read_ret = read_bmi160_sample(&bmi, &sample);
+            if (read_ret == ESP_OK) {
+                apply_gyro_bias(&sample, gyro_bias);
+                euler = update_filter(&filter, sample, dt_s);
+                read_success = true;
             }
-            // ICM读取失败，但仍然发送降级帧（只包含BMI数据�?
-            // 使用零值填充arm数据，保持数据流连续
         } else {
-            icm_consecutive_failures = 0;
-            apply_gyro_bias(&arm_sample, icm_gyro_bias);
-            arm_euler = update_filter(&arm_filter, arm_sample, dt_s);
-            arm_euler_valid = true;
+            static uint32_t no_imu_log_counter = 0;
+            if (++no_imu_log_counter % 200 == 1) {
+                ESP_LOGW(TAG, "No IMU present, running network-only loop");
+            }
         }
 
-        ImuSample torso_sample {};
-        const esp_err_t bmi_ret = read_bmi160_sample(&bmi, &torso_sample);
+        // 错误处理和恢复逻辑
+        if (!read_success) {
+            if (imu_runtime_ready) {
+                consecutive_failures++;
+                error_total++;
+                if (consecutive_failures == 1 || (consecutive_failures % 10) == 0) {
+                    ESP_LOGW(TAG, "Failed to read IMU sample: %s (consecutive=%d total=%lu)",
+                             esp_err_to_name(read_ret), consecutive_failures, error_total);
+                }
 
-        if (bmi_ret != ESP_OK) {
-            bmi_consecutive_failures++;
-            bmi_error_total++;
-            if (bmi_consecutive_failures == 1 || (bmi_consecutive_failures % 10) == 0) {
-                ESP_LOGW(TAG, "failed to read BMI160 sample: %s (consecutive=%d total=%lu)",
-                         esp_err_to_name(bmi_ret), bmi_consecutive_failures, bmi_error_total);
-            }
-            bool trigger_by_burst = bmi_consecutive_failures >= IMU_RECOVER_TRIGGER_CONSECUTIVE_ERRORS;
-            bool trigger_by_cooldown = (now_us - last_bmi_recover_us) >= IMU_RECOVER_COOLDOWN_US;
-            if (should_attempt_imu_recover(bmi_ret) && (trigger_by_burst || trigger_by_cooldown)) {
-                last_bmi_recover_us = now_us;
-                ESP_LOGW(TAG, "Attempting BMI160 runtime recover (consecutive=%d)...", bmi_consecutive_failures);
-                esp_err_t recover_ret = init_bmi160_with_retry(&bmi, IMU_RUNTIME_RECOVER_RETRIES);
-                if (recover_ret == ESP_OK) {
-                    ESP_LOGI(TAG, "BMI160 runtime recover success");
-                    bmi_consecutive_failures = 0;
-                } else {
-                    ESP_LOGE(TAG, "BMI160 runtime recover failed: %s", esp_err_to_name(recover_ret));
+                bool trigger_by_burst = consecutive_failures >= IMU_RECOVER_TRIGGER_CONSECUTIVE_ERRORS;
+                bool trigger_by_cooldown = (now_us - last_recover_us) >= IMU_RECOVER_COOLDOWN_US;
+
+                if (should_attempt_imu_recover(read_ret) && (trigger_by_burst || trigger_by_cooldown)) {
+                    last_recover_us = now_us;
+                    ESP_LOGW(TAG, "Attempting IMU runtime recover (consecutive=%d)...", consecutive_failures);
+
+                    esp_err_t recover_ret = ESP_FAIL;
+                    if (runtime_imu_type == ImuType::ICM42688) {
+                        recover_ret = init_icm42688_with_retry(&icm, IMU_RUNTIME_RECOVER_RETRIES);
+                    } else if (runtime_imu_type == ImuType::BMI160) {
+                        recover_ret = init_bmi160_with_retry(&bmi, IMU_RUNTIME_RECOVER_RETRIES);
+                    }
+
+                    if (recover_ret == ESP_OK) {
+                        ESP_LOGI(TAG, "IMU runtime recover success");
+                        consecutive_failures = 0;
+                    } else {
+                        ESP_LOGE(TAG, "IMU runtime recover failed: %s", esp_err_to_name(recover_ret));
+                    }
                 }
             }
-            // BMI读取失败，但仍然发送降级帧（只包含ARM数据�?
-            // 使用零值填充torso数据，保持数据流连续
         } else {
-            bmi_consecutive_failures = 0;
-            // Use actual time since last BMI filter update for correct gyro integration
-            float bmi_dt = static_cast<float>(now_us - last_bmi_update_us) / 1000000.0f;
-            last_bmi_update_us = now_us;
-            if (bmi_dt <= 0.0f || bmi_dt > 0.5f) {
-                bmi_dt = 0.01f;
-            }
-            apply_gyro_bias(&torso_sample, bmi_gyro_bias);
-            const EulerAngles torso_euler = update_filter(&torso_filter, torso_sample, bmi_dt);
-            // High-rate logs can block main loop and starve UDP sending
+            consecutive_failures = 0;
+
+            // 定期打印姿态数据
             static uint32_t attitude_log_counter = 0;
             if (++attitude_log_counter % 25 == 0) {
-                if (arm_euler_valid) {
-                    log_sample_and_attitude("arm/icm42688", arm_sample, arm_euler);
-                }
-                log_sample_and_attitude("torso/bmi160", torso_sample, torso_euler);
+                const char *imu_name = (runtime_imu_type == ImuType::ICM42688) ? "arm/icm42688" : "torso/bmi160";
+                log_sample_and_attitude(imu_name, sample, euler);
             }
         }
 
-        // 始终发送数据帧（即使BMI失败，也发送ARM数据�?
-        uint32_t timestamp_ms = static_cast<uint32_t>(now_us / 1000);
-        send_imu_data_via_udp(arm_sample, torso_sample, arm_filter, torso_filter, timestamp_ms);
+        // 发送单IMU数据
+        if (imu_runtime_ready) {
+            uint32_t timestamp_ms = static_cast<uint32_t>(now_us / 1000);
+            send_single_imu_data_via_udp(runtime_imu_type, sample, filter, timestamp_ms);
+        }
 
         vTaskDelay(SAMPLE_PERIOD_TICKS);
     }
